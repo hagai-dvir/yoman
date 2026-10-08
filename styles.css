@@ -207,3 +207,24 @@ details.card[open] > summary::after { content: "–"; }
 textarea.dict { width: 100%; border: 0; resize: none; color: var(--fg); font-family: var(--f-body); -webkit-appearance: none; appearance: none; }
 textarea.dict:focus { outline: 3px solid var(--honey); }
 input, textarea, select { font-size: max(16px, 1em); } /* iOS zooms into fields under 16px */.card > .chip { align-self: flex-start; }
+
+/* ---------- v1.2: one-button home ---------- */
+.home { gap: 18px; }
+.home-head { min-height: 28px; }
+.home-main { min-height: calc(100dvh - var(--nav-h) - 140px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; text-align: center; }
+.rec-huge { width: min(62vw, 230px); height: min(62vw, 230px); border-radius: 50%; border: 0; background: var(--dgreen); color: var(--honey); display: grid; place-items: center; box-shadow: 0 0 0 10px var(--paper), 0 0 0 15px var(--green), 0 7px 0 15px var(--dgreen-shadow); -webkit-touch-callout: none; user-select: none; }
+.rec-huge .ic { width: 42%; height: 42%; }
+.rec-huge:active { transform: translateY(3px); }
+.home-label { font-family: var(--f-display); font-size: 34px; color: var(--dgreen); margin-top: 14px; }
+.install-bar { background: var(--paper); border: 2px solid var(--honey); border-radius: 16px; padding: 10px 14px; font-size: 15px; }
+.install-bar summary { display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--dgreen); font-weight: 700; list-style: none; }
+.install-bar summary::-webkit-details-marker { display: none; }
+.install-bar summary .ic { width: 20px; height: 20px; flex: 0 0 auto; }
+.install-bar[open] { display: flex; flex-direction: column; gap: 8px; }
+.dict-hint { display: flex; align-items: center; gap: 12px; background: var(--dgreen); color: var(--paper); border-radius: 18px; padding: 14px 16px; font-family: var(--f-display); font-size: 22px; line-height: 1.3; }
+.dict-hint .ic { width: 34px; height: 34px; color: var(--honey); flex: 0 0 auto; }
+/* navigation stays, but quieter: the record button on the home screen is the main action */
+:root { --nav-h: 62px; }
+.nav button { font-size: 13px; }
+.nav .rec { width: 48px; height: 48px; margin-top: 0; box-shadow: none; }
+.nav .rec .ic { width: 24px; height: 24px; }

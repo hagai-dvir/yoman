@@ -10,7 +10,7 @@ import { buildKoru } from './koru.js';
 import { TEST_DB } from './db.js';
 import * as P from './platform.js';
 
-const VERSION = '1.1.1';
+const VERSION = '1.2.0';
 const app = document.getElementById('app');
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -28,7 +28,16 @@ const ui = {
   sd: null, photoTarget: null, restoreMode: false, settings: { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0 },
 };
 const refreshSettings = async () => { ui.settings = await V.getSettings(); return ui.settings; };
-const useDictation = () => ui.settings.inputMode === 'dictation' || P.liveSpeechLikelyBlocked() || !speechSupported();
+// Which input path a recording takes, and why (the reason goes to the diagnostics log).
+// Live recognition is always tried first, also in the iPhone Home Screen app; keyboard dictation is the fallback.
+// After live recognition failed on this exact browser version, go straight to dictation until iOS/Chrome updates.
+function chooseInputPath() {
+  if (ui.settings.inputMode === 'dictation') return { mode: 'dictation', reason: 'setting' };
+  if (!speechSupported()) return { mode: 'dictation', reason: 'no-speech-api' };
+  const fb = ui.settings.speechFallback;
+  if (fb && fb.ua === navigator.userAgent) return { mode: 'dictation', reason: 'learned:' + fb.reason };
+  return { mode: 'live', reason: fb ? 'retry-after-update' : 'default' };
+}
 
 // ---------------------------------------------------------------- navigation
 const TRANSIENT = { word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewPhoto: null };
@@ -129,15 +138,14 @@ const bioButton = () => (ui.bioPending
   : `<button class="btn wide" data-act="bio-enroll">${icon('finger')}הפעל ${P.biometricName}</button>`);
 
 // iPhone in a Safari tab: data can be evicted after 7 days without use. Installing prevents that.
-function installCard() {
+// Shown as a slim bar under the record button; tapping it opens the steps.
+function installBar() {
   if (!P.isIOS || P.isStandalone()) return '';
-  return `<section class="card install" role="note"><h2>חשוב באייפון: התקן במסך הבית</h2>
+  return `<details class="install-bar"><summary>${icon('download')}<span>חשוב באייפון: התקן את היומן במסך הבית</span></summary>
     <p>ב-Safari, אם לא תפתח את היומן 7 ימים, Safari רשאי למחוק אותו. יומן שמותקן במסך הבית מוגן מזה.</p>
     <ol class="steps"><li>לחץ על כפתור השיתוף של Safari (ריבוע עם חץ למעלה).</li><li>בחר "הוסף למסך הבית", ואז "הוסף".</li><li>מעכשיו פתח את היומן רק מהאייקון החדש.</li></ol>
-    <p class="note">היומן במסך הבית נפרד מזה שב-Safari. אם כבר הקלטת כאן: צור גיבוי (בהגדרות), ושחזר אותו ביומן המותקן.</p>
-    <p class="note">באפליקציה המותקנת אפל לא מאפשרת תמלול חי. ההקלטה נעשית שם בהכתבה של המקלדת (כפתור המיקרופון במקלדת).</p></section>`;
-}
-function backupNudge() {
+    <p class="note">היומן במסך הבית נפרד מזה שב-Safari. אם כבר הקלטת כאן: צור גיבוי (בהגדרות), ושחזר אותו ביומן המותקן.</p></details>`;
+}function backupNudge() {
   const days = (Date.now() - (ui.settings.lastBackupAt || 0)) / 86400000;
   const oldest = Math.min(...[...vault.entries.values()].map((e) => e.createdAt));
   if (!vault.entries.size || days < 7 || Date.now() - oldest < 3 * 86400000) return ''; // no nagging in the first days
@@ -226,16 +234,20 @@ const SCREENS = {
     <button class="btn ghost wide" data-act="tab" data-to="today">אחר כך</button>
   </section></div></main>`,
 
+  // One-button home: a single big record button fills the first screen. Everything else sits below it.
   today() {
     const k = today();
     const es = entriesOfDays([k]);
     const ps = photosOfDays([k]);
     const sum = summaryText('day', k);
-    return `<main class="scr with-nav">${wave('tr')}
-    <header class="head"><div><p class="eyebrow">חגי דביר · ${S.longDate(k)}</p><h1>היום</h1></div></header>
-    ${installCard()}
-    <section class="card hero"><button class="rec-big" data-act="record" aria-label="הקלטה חדשה">${icon('mic')}</button>
-      <div><h2>הקלטה חדשה</h2><p class="note">${useDictation() ? 'לוחצים, ואז מכתיבים בכפתור המיקרופון שבמקלדת.' : 'לוחצים, מדברים, ולוחצים "עצור" בסוף.'}</p></div></section>
+    return `<main class="scr with-nav home">${wave('tr')}
+    <header class="home-head"><p class="eyebrow">חגי דביר · ${S.longDate(k)}</p></header>
+    <section class="home-main">
+      <button class="rec-huge" data-act="record" aria-label="התחל להקליט">${icon('mic')}</button>
+      <p class="home-label">הקלט</p>
+      <p class="note">נגיעה אחת מתחילה להקליט, והמילים נכתבות לבד.</p>
+    </section>
+    ${installBar()}
     ${backupNudge()}
     <section class="card"><h2>ההקלטות של היום</h2>
       ${es.length ? `<div class="list">${es.map((e) => `<div class="item"><button class="item-main" data-act="open-entry" data-id="${e.id}" data-tab="tidy">
@@ -249,7 +261,6 @@ const SCREENS = {
       <button class="link" data-act="open-sum" data-kind="day" data-key="${k}">לסיכום המלא ←</button></section>
     </main>${nav()}`;
   },
-
   record: () => `<main class="scr rec-scr">${wave('bl')}
     <div class="row split"><span class="sticker"><i></i><span id="rec-time">00:00</span></span><span class="rec-status" id="rec-status">מתחיל…</span></div>
     <div class="lined rec-text" id="rec-text"><span class="muted">מדברים, והמילים יופיעו כאן.</span></div>
@@ -260,7 +271,8 @@ const SCREENS = {
 
   dictate: () => `<main class="scr rec-scr">${wave('bl')}
     <div class="row split"><span class="sticker"><i></i><span id="rec-time">00:00</span></span><span class="rec-status">הכתבה במקלדת</span></div>
-    <p class="notice">${ui.dict && ui.dict.why ? esc(ui.dict.why) + ' ' : ''}הקש בתוך הדף, ואז על כפתור המיקרופון במקלדת, ודבר. אם ההכתבה נעצרת, הקש עליו שוב. בסוף לחץ "שמור".</p>
+    <p class="dict-hint">${icon('mic')}<span>לחץ על המיקרופון במקלדת, ודבר</span></p>
+    <p class="note">${ui.dict && ui.dict.why ? esc(ui.dict.why) + ' ' : ''}אם המקלדת לא נפתחה, הקש על הדף. אם ההכתבה נעצרת, לחץ שוב על המיקרופון. בסוף לחץ "שמור".</p>
     <textarea class="lined rec-text dict" id="dict-ta" lang="he" dir="rtl" autocomplete="off" spellcheck="false" placeholder="המילים יופיעו כאן"></textarea>
     <p class="note">ההכתבה של המקלדת עוברת דרך ${P.speechVendor}. במצב הזה הקול עצמו לא נשמר.</p>
     <div class="stopzone"><button class="stop" data-act="stop-dict" aria-label="שמור"><i></i></button><span class="stop-l">שמור</span></div>
@@ -410,7 +422,7 @@ const SCREENS = {
       </details>
       <details class="card"><summary>הקלטה</summary>
         <label class="field">איך להקליט<select id="input-mode" data-change="input-mode"><option value="auto" ${d.settings.inputMode !== 'dictation' ? 'selected' : ''}>תמלול חי (מומלץ)</option><option value="dictation" ${d.settings.inputMode === 'dictation' ? 'selected' : ''}>הכתבה במקלדת</option></select></label>
-        ${P.liveSpeechLikelyBlocked() ? '<p class="notice">באפליקציה שמותקנת במסך הבית של האייפון, אפל לא מאפשרת תמלול חי. לכן ההקלטה כאן היא תמיד בהכתבה של המקלדת.</p>' : ''}
+        ${d.settings.speechFallback ? `<p class="notice">בהקלטה קודמת התמלול החי לא עבד כאן (${esc(d.settings.speechFallback.reason)}), ולכן ההקלטה נפתחת בהכתבה במקלדת. אחרי עדכון של המערכת ננסה שוב לבד.</p><button class="chip" data-act="retry-live">נסה שוב תמלול חי</button>` : ''}
         <label class="switch"><span>לשמור גם את הקול עצמו (מוצפן, 30 יום)</span><input type="checkbox" data-change="rec-audio" ${d.settings.recordAudio ? 'checked' : ''}></label>
         <p class="note">הקול נשמר כדי שאפשר יהיה לשמוע שוב ולתקן. אחרי 30 יום הוא נמחק, אלא אם סימנת "שמור לתמיד" בהקלטה. דקה של קול תופסת בערך רבע מגה.</p>
         <p class="note">אם התמלול והקלטת הקול מתנגשים על המיקרופון, התמלול מקבל עדיפות, והקול לא נשמר באותה הקלטה. תופיע על כך הודעה.</p>
@@ -512,7 +524,7 @@ async function regenerate(e) {
 
 // ---------------------------------------------------------------- recording
 const mmss = (ms) => { const s = Math.floor(ms / 1000); return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
-async function startRecording() {
+async function startRecording(pathReason = 'default') {
   if (ui.rec) return;
   // No await before r.start(): Safari only allows the microphone and recognition inside the tap itself.
   const settings = ui.settings;
@@ -532,7 +544,7 @@ async function startRecording() {
       if (s.kind === 'network' && st) st.textContent = 'אין חיבור לאינטרנט. התמלול צריך רשת. ממשיך לנסות…';
       if (s.kind === 'fatal') { toast(P.isIOS ? 'אין הרשאה למיקרופון או לזיהוי דיבור. אפשר לאשר בהגדרות > Safari, ולוודא שההכתבה (Siri ודיבור) מופעלת.' : 'אין הרשאה למיקרופון או לזיהוי דיבור. אפשר לאשר בהגדרות האתר ב-Chrome.', 8000); finishRecording('fatal'); }
       if (s.kind === 'need-tap') { const b = $('#rec-resume'); if (b) b.hidden = false; if (st) st.textContent = 'הזיהוי נעצר וממתין לנגיעה'; }
-      if (s.kind === 'unavailable') switchToDictation();
+      if (s.kind === 'unavailable') switchToDictation(s.reason);
       if (s.kind === 'audio' && au) {
         if (s.state === 'recording') au.textContent = 'גם הקול נשמר, מוצפן, ל-30 יום.';
         if (s.state === 'conflict') { au.textContent = conflictText(s.reason); toast('התמלול והקלטת הקול התנגשו. התמלול ממשיך, הקול לא נשמר.', 6000); }
@@ -544,7 +556,9 @@ async function startRecording() {
   go('record');
   try {
     await r.start();
-    V.log('rec-start', settings.recordAudio ? 'with-audio' : 'text-only');
+    V.log('rec-path', `live reason=${pathReason} ios=${P.isIOS} standalone=${P.isStandalone()} audio=${settings.recordAudio}`);
+    // Live recognition worked after an earlier failure (e.g. iOS fixed it): forget the learned fallback.
+    setTimeout(async () => { if (r.everStarted && ui.settings.speechFallback) { await V.setSettings({ speechFallback: null }); await refreshSettings(); V.log('rec-path', 'live works again, fallback cleared'); } }, 5000);
     const st = $('#rec-status');
     if (st) st.textContent = 'מקשיב…';
   } catch (e) {
@@ -586,24 +600,25 @@ async function finishRecording(reason = 'stop') {
 
 // ---------------------------------------------------------------- keyboard dictation (iOS Home Screen app, or by choice)
 // Must be called inside a tap so the textarea can take focus and raise the keyboard.
-function startDictation(why = '') {
+function startDictation(why = '', reason = 'chosen') {
   ui.dict = { t0: Date.now(), marks: [], why };
+  V.log('rec-path', `dictation reason=${reason} ios=${P.isIOS} standalone=${P.isStandalone()}`);
   go('dictate');
   const ta = $('#dict-ta');
   if (ta) ta.focus();
   ui.dict.timer = setInterval(() => { const el = $('#rec-time'); if (el && ui.dict) el.textContent = mmss(Date.now() - ui.dict.t0); }, 500);
-  V.log('dictation-start', why ? 'fallback' : 'chosen');
 }
 
-async function switchToDictation() {
+async function switchToDictation(failReason = 'unknown') {
   const rec = ui.rec;
   if (!rec || rec.finishing) return;
   rec.finishing = true;
   clearInterval(rec.timer);
   await rec.r.stop();
   ui.rec = null;
-  V.log('speech-unavailable', 'switching to dictation');
-  startDictation('התמלול החי לא זמין כאן.');
+  await V.setSettings({ speechFallback: { reason: failReason, ua: navigator.userAgent, at: Date.now() } });
+  await refreshSettings();
+  startDictation('התמלול החי לא עבד כאן, אז עברנו להכתבה. בפעם הבאה היא תיפתח מיד.', 'live-failed:' + failReason);
   toast('התמלול החי לא זמין כאן, אז עוברים להכתבה במקלדת.', 6000);
 }
 
@@ -830,7 +845,8 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
   'restore-mode-off': () => { ui.restoreMode = false; render(); },
   tab: (el) => { if (el.dataset.to === 'settings') ui.sd = null; go(el.dataset.to); },
   back: () => history.back(),
-  record: () => (useDictation() ? startDictation() : startRecording()),
+  record: () => { const c = chooseInputPath(); return c.mode === 'dictation' ? startDictation('', c.reason) : startRecording(c.reason); },
+  'retry-live': async () => { await V.setSettings({ speechFallback: null, inputMode: 'auto' }); await refreshSettings(); ui.sd = null; render(); toast('בהקלטה הבאה ננסה שוב תמלול חי.'); },
   'stop-dict': (el) => { el.disabled = true; finishDictation('stop'); },
   'rec-resume': (el) => { el.hidden = true; if (ui.rec) ui.rec.r.resume(); const st = $('#rec-status'); if (st) st.textContent = 'מקשיב…'; },
   'stop-rec': (el) => { el.disabled = true; finishRecording('stop'); },
@@ -1037,7 +1053,7 @@ const FORMS = {
 const CHANGES = {
   autolock: async (el) => { await V.setSettings({ autolockMin: +el.value }); await refreshSettings(); toast(`נעילה אחרי ${el.value} דקות.`); },
   'rec-audio': async (el) => { await V.setSettings({ recordAudio: el.checked }); await refreshSettings(); },
-  'input-mode': async (el) => { await V.setSettings({ inputMode: el.value }); await refreshSettings(); },
+  'input-mode': async (el) => { await V.setSettings({ inputMode: el.value, ...(el.value === 'auto' ? { speechFallback: null } : {}) }); await refreshSettings(); },
   'audio-keep': async (el) => { await V.setAudioKeep(el.dataset.id, el.checked); render(); toast(el.checked ? 'הקול יישמר לתמיד.' : 'הקול יימחק 30 יום אחרי ההקלטה.'); },
 };
 

@@ -18,7 +18,7 @@ export const isUnlocked = () => !!vault.key;
 export const uid = () => Date.now().toString(36) + '-' + C.toB64(C.rand(9)).replace(/[+/=]/g, '').slice(0, 10);
 
 // ---------- settings & diagnostics (plain, no content) ----------
-const DEFAULT_SETTINGS = { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0 };
+const DEFAULT_SETTINGS = { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, speechFallback: null };
 export async function getSettings() {
   const s = await db.get('meta', 'settings');
   return { ...DEFAULT_SETTINGS, ...(s || {}) };
