@@ -1,13 +1,13 @@
 // Offline shell for היומן. Caches only the app's own files. User data never passes through here
 // (it lives in IndexedDB, encrypted). Bump CACHE on every deploy so phones pick up the new version.
-const CACHE = 'yoman-v1.2.0';
+const CACHE = 'yoman-v1.4.0';
 const ASSETS = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
   'fonts/fonts.css',
   'fonts/secular-hebrew-400.woff2', 'fonts/secular-latin-400.woff2',
   'fonts/varela-hebrew-400.woff2', 'fonts/varela-latin-400.woff2',
   'js/app.js', 'js/crypto.js', 'js/db.js', 'js/exif.js', 'js/koru.js', 'js/platform.js', 'js/speech.js',
-  'js/summaries.js', 'js/tidy.js', 'js/vault.js', 'js/webauthn.js',
+  'js/summaries.js', 'js/tidy.js', 'js/vault.js', 'js/voice.js', 'js/webauthn.js',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
 ];
 

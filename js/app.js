@@ -2,21 +2,29 @@
 import * as V from './vault.js';
 import { vault } from './vault.js';
 import * as W from './webauthn.js';
-import { tidy, tokenize, rawText, tidyText, dictationSegments } from './tidy.js';
+import { tidy, tokenize, rawText, tidyText, dictationSegments, writtenSegments, tidyWritten } from './tidy.js';
 import { parseExif, mapsUrl } from './exif.js';
 import * as S from './summaries.js';
 import { Recorder, speechSupported } from './speech.js';
 import { buildKoru } from './koru.js';
 import { TEST_DB } from './db.js';
 import * as P from './platform.js';
+import * as VO from './voice.js';
 
-const VERSION = '1.2.0';
+const VERSION = '1.4.0';
+const WORD_PAGE = 1500;        // word buttons rendered at once in the raw view (100K-character entries stay fast)
+const SHARE_TEXT_MAX = 15000;   // longer texts are shared as a .txt file: share targets cut long text
+const QUICK_URL = new URL('./?rec=1', location.href.split(/[?#]/)[0]).href;
 const app = document.getElementById('app');
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const icon = (n, cls = 'ic') => `<svg class="${cls}" aria-hidden="true"><use href="#i-${n}"/></svg>`;
 const wave = (pos) => `<svg class="wave ${pos}" aria-hidden="true"><use href="#koru"/></svg>`;
 const HILLS = '<svg class="hills" viewBox="0 0 300 150" preserveAspectRatio="none" aria-hidden="true"><path d="M0 60 C60 20 120 50 170 40 S260 20 300 36 V150 H0Z" fill="#A7B347"/><path d="M0 100 C70 70 140 104 210 84 S280 80 300 88 V150 H0Z" fill="#6E9632"/></svg>';
+const entryDur = (e) => (e.input === 'written' ? 'נכתב' : fmtDur(e.durationSec || 0) + (e.written ? ' + כתיבה' : ''));
+const FS_BTN = '<button type="button" class="chip" data-act="fs-toggle">מסך מלא</button>';
+function grow(ta) { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 4 + 'px'; }
+const tidyFor = (e) => (e.input === 'written' ? tidyWritten(e.segments) : tidy(e.segments));
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} דק׳`;
 const today = () => S.dayKey(Date.now());
 
@@ -25,7 +33,8 @@ const ui = {
   entryId: null, entryTab: 'raw', libTab: 'raw', sumKind: 'day', sumKey: null,
   word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewPhoto: null,
   undo: new Map(), rec: null, dict: null, external: false, hasPrf: false, prfMeta: null, bioPending: null,
-  sd: null, photoTarget: null, restoreMode: false, settings: { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0 },
+  sd: null, photoTarget: null, restoreMode: false, settings: { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, carMode: false, quickCapture: false },
+  quick: false, mics: null, reader: null,
 };
 const refreshSettings = async () => { ui.settings = await V.getSettings(); return ui.settings; };
 // Which input path a recording takes, and why (the reason goes to the diagnostics log).
@@ -40,7 +49,7 @@ function chooseInputPath() {
 }
 
 // ---------------------------------------------------------------- navigation
-const TRANSIENT = { word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewPhoto: null };
+const TRANSIENT = { word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewPhoto: null, wordLimit: WORD_PAGE };
 function go(screen, patch = {}, mode = 'push') {
   Object.assign(ui, TRANSIENT, patch, { screen });
   const st = { screen, entryId: ui.entryId, entryTab: ui.entryTab, libTab: ui.libTab, sumKind: ui.sumKind, sumKey: ui.sumKey };
@@ -51,17 +60,23 @@ function go(screen, patch = {}, mode = 'push') {
 window.addEventListener('popstate', (e) => {
   if (ui.rec || ui.dict) { history.pushState({ screen: 'record' }, ''); return; } // never leave a running recording by "back"
   if (!V.isUnlocked()) return;
+  if (ui.screen === 'write') saveDraftNow();
   const st = e.state;
   if (!st || !st.screen || ['record', 'dictate', 'setup', 'lock', 'bioOffer', 'boot'].includes(st.screen)) { go('today', {}, 'none'); return; }
   go(st.screen, st, 'none');
 });
 
 function render() {
-  if (!V.isUnlocked() && !['setup', 'lock', 'boot'].includes(ui.screen)) ui.screen = ui.hasVault ? 'lock' : 'setup';
+  // While locked only the lock screens and the quick-capture screens (which never show diary content) may render.
+  const lockedOk = ['setup', 'lock', 'boot'].concat(ui.quick ? ['record', 'dictate', 'tapstart', 'quickDone'] : []);
+  if (!V.isUnlocked() && !lockedOk.includes(ui.screen)) ui.screen = ui.hasVault ? 'lock' : 'setup';
   const fn = SCREENS[ui.screen] || SCREENS.today;
   app.innerHTML = fn() + (ui.viewPhoto ? viewer() : '');
   if (ui.screen !== ui.lastScreen) { window.scrollTo(0, 0); ui.lastScreen = ui.screen; }
   hydrate();
+  app.querySelectorAll('textarea.grow').forEach(grow);
+  const wt = $('#write-ta');
+  if (wt) { updateWriteCount(); if (!ui.writeFocused) { ui.writeFocused = true; wt.focus(); } }
   const wi = $('#word-input');
   if (wi) { wi.focus(); if (ui.word && ui.word.mode !== 'add') wi.select(); }
 }
@@ -224,7 +239,9 @@ const SCREENS = {
     <div class="row"><button class="btn" style="flex:1" type="submit">פתח</button>
     ${ui.hasPrf ? `<button type="button" class="round" data-act="bio-unlock" aria-label="פתח ב-${P.biometricName}">${icon('finger')}</button>` : ''}</div>
     <p class="note">${ui.hasPrf ? `${P.biometricName}, או סיסמה.` : 'הכול מוצפן בטלפון הזה.'}</p>
-  </form></div></main>`,
+  </form>
+  ${ui.settings.quickCapture && ui.hasInbox ? `<button class="btn honey wide quick-btn" data-act="quick-rec">${icon('mic')}הקלטה מהירה בלי לפתוח</button>` : ''}
+  </div></main>`,
 
   bioOffer: () => `<main class="scr">${wave('big')}${HILLS}<div class="lockwrap">
   <section class="card"><h2>פתיחה מהירה</h2>
@@ -246,12 +263,13 @@ const SCREENS = {
       <button class="rec-huge" data-act="record" aria-label="התחל להקליט">${icon('mic')}</button>
       <p class="home-label">הקלט</p>
       <p class="note">נגיעה אחת מתחילה להקליט, והמילים נכתבות לבד.</p>
+      <button class="btn ghost write-btn" data-act="write-new">${icon('pencil')}${ui.draft && ui.draft.text ? 'המשך את הטיוטה' : 'כתוב'}</button>
     </section>
     ${installBar()}
     ${backupNudge()}
     <section class="card"><h2>ההקלטות של היום</h2>
       ${es.length ? `<div class="list">${es.map((e) => `<div class="item"><button class="item-main" data-act="open-entry" data-id="${e.id}" data-tab="tidy">
-        <span class="d"><span>${S.timeOf(e.createdAt)}</span><span>${fmtDur(e.durationSec)}</span></span><span class="t"><b>${esc(e.tidy.title)}</b></span></button></div>`).join('')}</div>` : '<p class="muted">עוד לא הקלטת היום.</p>'}
+        <span class="d"><span>${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span><span class="t"><b>${esc(e.tidy.title)}</b></span></button></div>`).join('')}</div>` : '<p class="muted">עוד לא הקלטת היום.</p>'}
     </section>
     <section class="card"><h2>תמונות של היום</h2>
       ${ps.length ? `<div class="photos">${photosHtml(ps, false)}</div>` : '<p class="muted">אין עדיין תמונות.</p>'}
@@ -261,14 +279,32 @@ const SCREENS = {
       <button class="link" data-act="open-sum" data-kind="day" data-key="${k}">לסיכום המלא ←</button></section>
     </main>${nav()}`;
   },
-  record: () => `<main class="scr rec-scr">${wave('bl')}
+  record() {
+    const car = ui.settings.carMode;
+    const phrase = car && ui.settings.endPhrase ? ui.settings.endPhrase : '';
+    const silence = car && ui.settings.silenceStopSec ? ui.settings.silenceStopSec : 0;
+    const handsFree = [phrase ? `אמור "${esc(phrase)}" כדי לסיים` : '', silence ? `ההקלטה תיעצר אחרי ${silence} שניות שקט` : ''].filter(Boolean).join(' · ');
+    return `<main class="scr rec-scr${car ? ' car' : ''}">${wave('bl')}
+    ${ui.quick ? '<p class="quick-badge">הקלטה מהירה · היומן נשאר נעול, וההקלטה תיכנס אליו כשתפתח אותו</p>' : ''}
     <div class="row split"><span class="sticker"><i></i><span id="rec-time">00:00</span></span><span class="rec-status" id="rec-status">מתחיל…</span></div>
+    <p class="rec-mic" id="rec-mic">מיקרופון: ${P.isIOS ? 'לפי בחירת האייפון (דיבורית או אוזניות, אם מחוברות)' : 'ברירת המחדל של הטלפון'}</p>
     <div class="lined rec-text" id="rec-text"><span class="muted">מדברים, והמילים יופיעו כאן.</span></div>
     <p class="note" id="rec-audio"></p>
+    ${handsFree ? `<p class="handsfree">${handsFree}</p>` : ''}
     <button class="btn honey wide" id="rec-resume" data-act="rec-resume" hidden>הזיהוי נעצר. הקש כאן כדי להמשיך</button>
-    <div class="stopzone"><button class="stop" data-act="stop-rec" aria-label="עצור"><i></i></button><span class="stop-l">עצור</span></div>
-  </main>`,
+    <div class="stopzone"><button class="stop${car ? ' huge' : ''}" data-act="stop-rec" aria-label="עצור"><i></i></button><span class="stop-l">עצור</span></div>
+  </main>`;
+  },
 
+  // Shown when a hands-free start (Siri shortcut, ?rec=1) was refused by the browser: one tap anywhere starts.
+  tapstart: () => `<main class="scr tapstart"><button class="tap-all" data-act="tap-start" aria-label="התחל להקליט">
+    <span class="rec-huge" aria-hidden="true">${icon('mic')}</span><span class="home-label">גע בכל מקום כדי להקליט</span>
+    <span class="note">הדפדפן לא מאפשר להתחיל להקליט בלי נגיעה אחת.</span></button></main>`,
+
+  quickDone: () => `<main class="scr">${wave('big')}${HILLS}<div class="lockwrap">
+    <section class="card"><h2>נשמר</h2><p>ההקלטה נשמרה מוצפנת. היא תיכנס ליומן כשתפתח אותו בסיסמה או ב-${P.biometricName}.</p>
+    <button class="btn wide" data-act="quick-rec">${icon('mic')}הקלטה נוספת</button>
+    <button class="btn ghost wide" data-act="quick-exit">פתח את היומן</button></section></div></main>`,
   dictate: () => `<main class="scr rec-scr">${wave('bl')}
     <div class="row split"><span class="sticker"><i></i><span id="rec-time">00:00</span></span><span class="rec-status">הכתבה במקלדת</span></div>
     <p class="dict-hint">${icon('mic')}<span>לחץ על המיקרופון במקלדת, ודבר</span></p>
@@ -278,6 +314,21 @@ const SCREENS = {
     <div class="stopzone"><button class="stop" data-act="stop-dict" aria-label="שמור"><i></i></button><span class="stop-l">שמור</span></div>
   </main>`,
 
+  // Full-screen writing. The page is sized to the visible viewport, so the text stays above the iOS keyboard.
+  write() {
+    const ctx = ui.writeCtx || { mode: 'new' };
+    const target = ctx.mode === 'append' ? vault.entries.get(ctx.entryId) : null;
+    return `<main class="write-scr">
+      <header class="write-bar">
+        <button class="chip" data-act="write-cancel">סגור</button>
+        <div class="write-mid"><b>${target ? 'הוספה ל: ' + esc(target.tidy.title) : 'כתיבה חדשה'}</b><span id="write-state" class="note">${ui.writeRestored ? 'טיוטה קודמת נפתחה' : 'נשמר אוטומטית, מוצפן'}</span></div>
+        <button class="btn" data-act="write-save">שמור</button>
+      </header>
+      <textarea id="write-ta" class="write-ta" lang="he" dir="rtl" placeholder="כתוב כאן. אין הגבלת אורך." autocomplete="off">${esc(ui.writeText || '')}</textarea>
+      <footer class="write-foot"><span id="write-count" class="note"></span>
+        ${ui.writeText ? `<button class="chip" data-act="write-discard">${ui.confirm === 'write-discard' ? 'לחץ שוב למחיקת הטיוטה' : 'מחק טיוטה'}</button>` : ''}</footer>
+    </main>`;
+  },
   entry() {
     const e = vault.entries.get(ui.entryId);
     if (!e) { ui.screen = 'today'; return SCREENS.today(); }
@@ -286,36 +337,45 @@ const SCREENS = {
     const undoBtn = `<button class="chip" data-act="undo" ${stack.length ? '' : 'disabled'}>${icon('undo')}בטל</button>`;
     let body;
     if (ui.entryTab === 'raw') {
-      const tools = `<div class="row">${undoBtn}<button class="chip ${on(ui.freeEdit)}" data-act="free-edit">${icon('text')}עריכה חופשית</button>${stale ? `<button class="chip hot" data-act="regen">${icon('sparkle')}סדר מחדש</button>` : ''}</div>`;
+      const tools = `<div class="row">${undoBtn}<button class="chip ${on(ui.freeEdit)}" data-act="free-edit">${icon('text')}עריכה חופשית</button><button class="chip" data-act="write-append">${icon('pencil')}הוסף כתיבה</button>${stale ? `<button class="chip hot" data-act="regen">${icon('sparkle')}סדר מחדש</button>` : ''}</div>`;
       if (ui.freeEdit) {
         body = `${tools}<form data-form="free-edit" class="col" style="display:flex;flex-direction:column;gap:10px">
           <p class="note">כל שורה היא קטע דיבור. אפשר לשנות הכול.</p>
-          <textarea class="input" id="free-ta" rows="12">${esc(e.segments.map((s) => s.text).join('\n'))}</textarea>
-          <div class="row"><button class="btn" type="submit">שמור</button><button type="button" class="btn ghost" data-act="free-cancel">ביטול</button></div></form>`;
+          <textarea class="input grow" id="free-ta">${esc(e.segments.map((s) => s.text).join('\n'))}</textarea>
+          <div class="row"><button class="btn" type="submit">שמור</button><button type="button" class="btn ghost" data-act="free-cancel">ביטול</button>${FS_BTN}</div></form>`;
       } else {
-        const words = e.segments.map((s, si) => {
+        // Word buttons are rendered in pages, so a 100,000-character entry does not create ~18,000 buttons at once.
+        const limit = ui.wordLimit || WORD_PAGE;
+        const parts = [];
+        let total = 0;
+        e.segments.forEach((s, si) => {
           const fixed = new Set(s.fixed || []);
-          return tokenize(s.text).map((w, wi) => {
+          tokenize(s.text).forEach((w, wi) => {
+            total++;
+            if (total > limit) return;
             const sel = ui.word && ui.word.s === si && ui.word.w === wi;
-            return `<button class="w${sel ? ' sel' : ''}${fixed.has(wi) ? ' fixed' : ''}" data-act="word" data-s="${si}" data-w="${wi}">${esc(w)}</button>`;
-          }).join(' ');
-        }).join(' ');
-        body = `${tools}${words ? `<p class="words">${words}</p>` : '<p class="muted">לא נקלט טקסט בהקלטה הזו.</p>'}
+            parts.push(`<button class="w${sel ? ' sel' : ''}${fixed.has(wi) ? ' fixed' : ''}" data-act="word" data-s="${si}" data-w="${wi}">${esc(w)}</button>`);
+          });
+        });
+        const words = parts.join(' ');
+        const more = total > limit ? `<div class="row"><button class="chip" data-act="more-words">הצג עוד ${Math.min(WORD_PAGE, total - limit).toLocaleString('he-IL')} מילים</button><span class="note">מוצגות ${limit.toLocaleString('he-IL')} מתוך ${total.toLocaleString('he-IL')} מילים</span></div>` : '';
+        body = `${tools}${words ? `<p class="words">${words}</p>${more}` : '<p class="muted">לא נקלט טקסט בהקלטה הזו.</p>'}
           <p class="note">נגיעה במילה פותחת תיקון. קו גלי מסמן מילה שתוקנה.</p>
           ${stale ? '<p class="notice">תיקנת את הגרסה הגולמית. "סדר מחדש" יעדכן את הגרסה המסודרת.</p>' : ''}`;
       }
     } else if (ui.tidyEdit) {
       body = `<form data-form="tidy-edit" style="display:flex;flex-direction:column;gap:10px">
         <label class="field">כותרת<input id="tidy-title" value="${esc(e.tidy.title)}"></label>
-        <label class="field">טקסט (שורה ריקה בין פסקאות)<textarea class="input typedta" id="tidy-ta" rows="14">${esc(e.tidy.paragraphs.join('\n\n'))}</textarea></label>
-        <div class="row"><button class="btn" type="submit">שמור</button><button type="button" class="btn ghost" data-act="tidy-cancel">ביטול</button></div></form>`;
+        <label class="field">טקסט (שורה ריקה בין פסקאות)<textarea class="input typedta grow" id="tidy-ta">${esc(e.tidy.paragraphs.join('\n\n'))}</textarea></label>
+        <div class="row"><button class="btn" type="submit">שמור</button><button type="button" class="btn ghost" data-act="tidy-cancel">ביטול</button>${FS_BTN}</div></form>`;
     } else {
       body = `<article class="typed"><h2>${esc(e.tidy.title)}</h2>${e.tidy.paragraphs.map((p) => `<p>${esc(p)}</p>`).join('') || '<p class="muted">אין טקסט.</p>'}</article>
         ${e.tidy.edited ? '<p class="note">הגרסה הזו נערכה ידנית.</p>' : ''}
         ${stale ? '<p class="notice">הגרסה הגולמית תוקנה אחרי הסידור. "סדר מחדש מהגולמי" יעדכן כאן.</p>' : ''}
         <div class="row">${undoBtn}<button class="chip" data-act="tidy-edit">${icon('pencil')}ערוך</button>
         <button class="chip ${stale ? 'hot' : ''}" data-act="regen">${icon('sparkle')}סדר מחדש מהגולמי</button>
-        <button class="chip" data-act="share-entry">${icon('share')}שלח</button></div>`;
+        <button class="chip" data-act="share-entry">${icon('share')}שלח</button>
+        <button class="chip" data-act="tts-play" data-src="entry">${icon('speaker')}השמע</button></div>`;
     }
     const a = e.audioId && vault.audio.get(e.audioId);
     let audio = '';
@@ -327,7 +387,7 @@ const SCREENS = {
     const photos = (e.photoIds || []).map((id) => vault.photos.get(id)).filter(Boolean);
     return `<main class="scr with-nav">${wave('tr')}
       <header class="head"><button class="icon-btn" data-act="back" aria-label="חזרה">${icon('back')}</button>
-        <p class="eyebrow" style="flex:1">${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${fmtDur(e.durationSec)}</p></header>
+        <p class="eyebrow" style="flex:1">${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${entryDur(e)}${e.via === 'quick' ? ' · הקלטה מהירה' : ''}</p></header>
       <div><div class="tabs"><button data-act="entry-tab" data-tab="raw" class="${on(ui.entryTab === 'raw')}">מה שאמרתי</button><button data-act="entry-tab" data-tab="tidy" class="${on(ui.entryTab === 'tidy')}">מסודר לפרסום</button></div>
       <div class="folder">${confirmBox('regen', 'הגרסה המסודרת נערכה ידנית. סידור מחדש ידרוס את העריכה (אפשר לבטל אחר כך).', 'regen-yes', 'סדר מחדש')}${body}</div></div>
       ${audio ? `<section class="card audio-box"><h2>הקול</h2>${audio}</section>` : ''}
@@ -348,7 +408,7 @@ const SCREENS = {
         ? `<span class="t hand">${esc(rawText(e.segments).slice(0, 220)) || '…'}</span>`
         : `<span class="t"><b>${esc(e.tidy.title)}</b> ${esc(S.firstSentences(e.tidy.paragraphs.join(' '), 1))}</span>`;
       return `${h}<div class="item"><button class="item-main" data-act="open-entry" data-id="${e.id}" data-tab="${raw ? 'raw' : 'tidy'}">
-        <span class="d"><span>${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)}</span><span>${fmtDur(e.durationSec)}</span></span>${preview}</button>
+        <span class="d"><span>${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span>${preview}</button>
         <button class="other" data-act="open-entry" data-id="${e.id}" data-tab="${raw ? 'tidy' : 'raw'}">${raw ? 'לגרסה המסודרת ←' : 'למה שאמרתי ←'}</button></div>`;
     }).join('');
     return `<main class="scr with-nav">${wave('tr')}
@@ -375,8 +435,8 @@ const SCREENS = {
     const dots = kind === 'week' ? `<div class="days" aria-label="ימים עם הקלטה">${days.map((k, i) => `<span><i class="${entriesOfDays([k]).length ? 'y' : ''}"></i>${S.DAY_LETTERS[i]}</span>`).join('')}</div>` : '';
     const photos = photosOfDays(days);
     const body = ui.sumEdit
-      ? `<form data-form="sum-edit" style="display:flex;flex-direction:column;gap:10px"><textarea class="input typedta" id="sum-ta" rows="14">${esc(text)}</textarea>
-          <div class="row"><button class="btn" type="submit">שמור</button><button type="button" class="btn ghost" data-act="sum-cancel">ביטול</button></div></form>`
+      ? `<form data-form="sum-edit" style="display:flex;flex-direction:column;gap:10px"><textarea class="input typedta grow" id="sum-ta">${esc(text)}</textarea>
+          <div class="row"><button class="btn" type="submit">שמור</button><button type="button" class="btn ghost" data-act="sum-cancel">ביטול</button>${FS_BTN}</div></form>`
       : `${text ? `<p class="sumtext">${esc(text)}</p>` : '<p class="muted">אין עדיין הקלטות בתקופה הזו.</p>'}
          <p class="note">${edited ? 'נערך ידנית.' : source + '. מתעדכן לבד.'}</p>
          ${newer ? '<p class="notice">נוספו הקלטות אחרי העריכה. "בנה מחדש" יכלול אותן וידרוס את העריכה.</p>' : ''}
@@ -390,6 +450,7 @@ const SCREENS = {
       <section class="card">${dots}${body}</section>
       ${photos.length ? `<section class="card"><h2>תמונות</h2><div class="photos">${photosHtml(photos, false)}</div></section>` : ''}
       <div class="row"><button class="btn honey" style="flex:1" data-act="share-sum" ${text ? '' : 'disabled'}>${icon('share')}שלח</button>
+        <button class="round" data-act="tts-play" data-src="sum" aria-label="השמע" ${text ? '' : 'disabled'}>${icon('speaker')}</button>
         <button class="round" data-act="copy-sum" aria-label="העתק" ${text ? '' : 'disabled'}>${icon('copy')}</button>
         <button class="round" data-act="file-sum" aria-label="הורד כקובץ טקסט" ${text ? '' : 'disabled'}>${icon('download')}</button></div>
     </main>${nav()}`;
@@ -420,7 +481,39 @@ const SCREENS = {
           <label class="field">שוב את החדשה<input type="password" id="cp-new2" autocomplete="new-password"></label>
           <p class="err" hidden></p><button class="btn" type="submit">החלף סיסמה</button></form>
       </details>
-      <details class="card"><summary>הקלטה</summary>
+      <details class="card"${d.settings.carMode ? ' open' : ''}><summary>נהיגה ודיבורית</summary>
+        <label class="switch"><span>מצב נהיגה: צלילים, כפתור עצירה ענק, וסיום בלי ידיים</span><input type="checkbox" data-change="car-mode" ${d.settings.carMode ? 'checked' : ''}></label>
+        <label class="field">מילת סיום (נמחקת מהטקסט). השאר ריק כדי לכבות<input id="end-phrase" data-change="end-phrase" value="${esc(d.settings.endPhrase || '')}" autocomplete="off"></label>
+        <label class="field">עצירה אוטומטית אחרי שקט<select id="silence-stop" data-change="silence-stop">${[[0, 'כבוי'], [20, '20 שניות'], [30, '30 שניות'], [60, 'דקה'], [120, '2 דקות']].map(([v, l]) => `<option value="${v}" ${d.settings.silenceStopSec === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+        <label class="switch"><span>לומר "נשמר" בסוף (בנוסף לצליל)</span><input type="checkbox" data-change="spoken-cues" ${d.settings.spokenCues ? 'checked' : ''}></label>
+        <p class="note">מילת הסיום והעצירה אחרי שקט פועלות רק במצב נהיגה. בלי מצב נהיגה ההקלטה נעצרת רק כשלוחצים "עצור".</p>
+        ${P.isIOS
+          ? '<p class="note">באייפון הדפדפן לא יכול לבחור מיקרופון. כשדיבורית הרכב או אוזניות בלוטות\' מחוברות, האייפון בדרך כלל משתמש במיקרופון שלהן. במסך ההקלטה כתוב איזה מיקרופון פעיל, כשאפשר לדעת.</p>'
+          : `<label class="field">מיקרופון<select id="mic" data-change="mic"><option value="">ברירת המחדל של הטלפון</option>${(ui.mics || []).map((m) => `<option value="${esc(m.deviceId)}" ${d.settings.micDeviceId === m.deviceId ? 'selected' : ''}>${esc(m.label || 'מיקרופון')}</option>`).join('')}</select></label>
+             <button class="chip" data-act="mics-load">${icon('mic')}הצג את המיקרופונים המחוברים</button>
+             <p class="note">המיקרופון שנבחר משמש להקלטת הקול. התמלול של Chrome משתמש בו רק אם הדפדפן תומך בזה, ואם לא, הוא שומע מהמיקרופון של המערכת.</p>`}
+      </details>
+      <details class="card"><summary>הפעלה בקול</summary>
+        <label class="switch"><span>הקלטה מהירה בלי לפתוח את היומן</span><input type="checkbox" data-change="quick-capture" ${d.settings.quickCapture ? 'checked' : ''}></label>
+        <p class="note">כשזה פועל, אפשר להקליט גם כשהיומן נעול. ההקלטה נשמרת מוצפנת, ורק פתיחה בסיסמה או ב-${P.biometricName} מכניסה אותה ליומן. מי שמחזיק את הטלפון לא יכול לקרוא כלום, אבל יכול להוסיף הקלטה. לכן הקלטות כאלה מסומנות "הקלטה מהירה".</p>
+        <p>הכתובת להקלטה מיידית:</p>
+        <p class="url-box" dir="ltr">${esc(QUICK_URL)}</p>
+        <button class="chip" data-act="copy-quick-url">${icon('copy')}העתק כתובת</button>
+        ${P.isIOS ? `<h3>קיצור ל-Siri</h3><ol class="steps">
+          <li>פתח את האפליקציה "קיצורים" (Shortcuts).</li>
+          <li>לחץ על + למעלה.</li>
+          <li>לחץ "הוסף פעולה", חפש "פתח כתובות URL" ובחר בה.</li>
+          <li>לחץ על "URL" והדבק את הכתובת שהעתקת.</li>
+          <li>לחץ על שם הקיצור למעלה, ושנה אותו ל"יומן".</li>
+          <li>מעכשיו אמור: "היי סירי, יומן".</li></ol>
+          <p class="notice">הקיצור פותח את היומן ב-Safari, לא ביומן שמותקן במסך הבית. אפל לא מאפשרת לקיצור לפתוח אפליקציה של מסך הבית. היומן ב-Safari והיומן המותקן שומרים נתונים בנפרד, ולכן כדי להשתמש ב-Siri צריך לנהל את היומן ב-Safari.</p>
+          <p class="note">אם האייפון נעול, Siri תבקש קודם לפתוח אותו. ייתכן גם ש-Safari ידרוש נגיעה אחת כדי להתחיל להקליט. אז יופיע מסך שכולו כפתור.</p>`
+        : `<h3>באנדרואיד</h3><ol class="steps"><li>אם היומן מותקן, לחיצה ארוכה על האייקון מציגה "הקלטה מהירה".</li><li>אפשר גם לומר "Hey Google, פתח את היומן" ולגעת בכפתור הגדול.</li></ol>`}
+      </details>
+      <details class="card"><summary>השמעה בקול</summary>
+        <p>הכפתור "השמע" מקריא את הגרסה המסודרת ואת הסיכומים בקול עברי של הטלפון. כשדיבורית או אוזניות מחוברות, הקול יוצא דרכן.</p>
+        <p class="note">${(() => { const v = VO.pickVoice(); return v ? `הקול: ${esc(v.name)} · ${v.localService ? 'נוצר בתוך הטלפון, בלי לשלוח את הטקסט' : `נוצר בשרת של ${P.speechVendor}: הטקסט נשלח אליו`}` : 'עוד לא נמצא קול עברי (לפעמים הרשימה נטענת רק אחרי ההשמעה הראשונה).'; })()}</p>
+      </details>      <details class="card"><summary>הקלטה</summary>
         <label class="field">איך להקליט<select id="input-mode" data-change="input-mode"><option value="auto" ${d.settings.inputMode !== 'dictation' ? 'selected' : ''}>תמלול חי (מומלץ)</option><option value="dictation" ${d.settings.inputMode === 'dictation' ? 'selected' : ''}>הכתבה במקלדת</option></select></label>
         ${d.settings.speechFallback ? `<p class="notice">בהקלטה קודמת התמלול החי לא עבד כאן (${esc(d.settings.speechFallback.reason)}), ולכן ההקלטה נפתחת בהכתבה במקלדת. אחרי עדכון של המערכת ננסה שוב לבד.</p><button class="chip" data-act="retry-live">נסה שוב תמלול חי</button>` : ''}
         <label class="switch"><span>לשמור גם את הקול עצמו (מוצפן, 30 יום)</span><input type="checkbox" data-change="rec-audio" ${d.settings.recordAudio ? 'checked' : ''}></label>
@@ -515,7 +608,7 @@ async function wordOp(op) {
 
 async function regenerate(e) {
   pushUndo(e);
-  e.tidy = { ...tidy(e.segments), edited: false, fromRawVersion: e.rawVersion };
+  e.tidy = { ...tidyFor(e), edited: false, fromRawVersion: e.rawVersion };
   await V.saveEntry(e);
   Object.assign(ui, { confirm: null, entryTab: 'tidy' });
   render();
@@ -524,12 +617,19 @@ async function regenerate(e) {
 
 // ---------------------------------------------------------------- recording
 const mmss = (ms) => { const s = Math.floor(ms / 1000); return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
-async function startRecording(pathReason = 'default') {
+// opts.quick: the diary is locked; the result is sealed into the inbox instead of the diary.
+// opts.auto: started without a tap (Siri shortcut / ?rec=1). If the browser refuses, show one big tap target.
+async function startRecording(pathReason = 'default', opts = {}) {
   if (ui.rec) return;
   // No await before r.start(): Safari only allows the microphone and recognition inside the tap itself.
   const settings = ui.settings;
+  const car = !!settings.carMode;
+  if (car && !opts.auto) VO.primeAudio();
   const r = new Recorder({
     withAudio: settings.recordAudio,
+    endPhrase: car ? (settings.endPhrase || '') : '',
+    silenceStopMs: car ? (settings.silenceStopSec || 0) * 1000 : 0,
+    deviceId: P.isIOS ? '' : (settings.micDeviceId || ''),
     log: (ev, d) => V.log(ev, d),
     onUpdate: ({ finalText, interim }) => {
       const el = $('#rec-text');
@@ -540,11 +640,14 @@ async function startRecording(pathReason = 'default') {
     onStatus: (s) => {
       const st = $('#rec-status');
       const au = $('#rec-audio');
+      if (opts.auto && !r.everStarted && (s.kind === 'fatal' || s.kind === 'unavailable')) { autoStartRefused(r, s); return; }
       if (s.kind === 'restart' && st) st.textContent = `מקשיב… חודש אוטומטית ×${s.count}`;
       if (s.kind === 'network' && st) st.textContent = 'אין חיבור לאינטרנט. התמלול צריך רשת. ממשיך לנסות…';
       if (s.kind === 'fatal') { toast(P.isIOS ? 'אין הרשאה למיקרופון או לזיהוי דיבור. אפשר לאשר בהגדרות > Safari, ולוודא שההכתבה (Siri ודיבור) מופעלת.' : 'אין הרשאה למיקרופון או לזיהוי דיבור. אפשר לאשר בהגדרות האתר ב-Chrome.', 8000); finishRecording('fatal'); }
-      if (s.kind === 'need-tap') { const b = $('#rec-resume'); if (b) b.hidden = false; if (st) st.textContent = 'הזיהוי נעצר וממתין לנגיעה'; }
+      if (s.kind === 'need-tap') { const b = $('#rec-resume'); if (b) b.hidden = false; if (st) st.textContent = 'הזיהוי נעצר וממתין לנגיעה'; if (car) VO.beep('alert'); }
       if (s.kind === 'unavailable') switchToDictation(s.reason);
+      if (s.kind === 'end-phrase' || s.kind === 'silence-stop') finishRecording(s.kind);
+      if (s.kind === 'mic') { const m = $('#rec-mic'); if (m) m.textContent = 'מיקרופון: ' + (s.label || 'לא ידוע'); }
       if (s.kind === 'audio' && au) {
         if (s.state === 'recording') au.textContent = 'גם הקול נשמר, מוצפן, ל-30 יום.';
         if (s.state === 'conflict') { au.textContent = conflictText(s.reason); toast('התמלול והקלטת הקול התנגשו. התמלול ממשיך, הקול לא נשמר.', 6000); }
@@ -552,23 +655,56 @@ async function startRecording(pathReason = 'default') {
       }
     },
   });
-  ui.rec = { r, t0: Date.now() };
+  ui.rec = { r, t0: Date.now(), quick: !!opts.quick, auto: !!opts.auto, car };
+  if (opts.quick) ui.quick = true;
   go('record');
   try {
     await r.start();
-    V.log('rec-path', `live reason=${pathReason} ios=${P.isIOS} standalone=${P.isStandalone()} audio=${settings.recordAudio}`);
-    // Live recognition worked after an earlier failure (e.g. iOS fixed it): forget the learned fallback.
-    setTimeout(async () => { if (r.everStarted && ui.settings.speechFallback) { await V.setSettings({ speechFallback: null }); await refreshSettings(); V.log('rec-path', 'live works again, fallback cleared'); } }, 5000);
+    V.log('rec-path', `live reason=${pathReason} ios=${P.isIOS} standalone=${P.isStandalone()} audio=${settings.recordAudio} car=${car} quick=${!!opts.quick} auto=${!!opts.auto}`);
+    if (!opts.auto) {
+      // Live recognition worked after an earlier failure (e.g. iOS fixed it): forget the learned fallback.
+      setTimeout(async () => { if (r.everStarted && ui.settings.speechFallback) { await V.setSettings({ speechFallback: null }); await refreshSettings(); V.log('rec-path', 'live works again, fallback cleared'); } }, 5000);
+    }
+    if (car) setTimeout(() => { if (r.everStarted) VO.beep('start'); }, 50);
     const st = $('#rec-status');
     if (st) st.textContent = 'מקשיב…';
   } catch (e) {
     ui.rec = null;
     V.log('rec-start-failed', e.message);
+    if (opts.auto) { go('tapstart', {}, 'replace'); return; }
     toast('לא הצלחתי להתחיל הקלטה: ' + e.message);
-    go('today', {}, 'replace');
+    go(ui.quick ? 'lock' : 'today', {}, 'replace');
     return;
   }
-  ui.rec.timer = setInterval(() => { const el = $('#rec-time'); if (el) el.textContent = mmss(Date.now() - ui.rec.t0); }, 500);
+  ui.rec.timer = setInterval(() => { const el = $('#rec-time'); if (el && ui.rec) el.textContent = mmss(Date.now() - ui.rec.t0); }, 500);
+}
+
+// Start whichever input path applies; quick = the diary is locked and the result goes to the inbox.
+function startAny(reason, quick) {
+  if (quick) ui.quick = true;
+  const c = chooseInputPath();
+  if (c.mode === 'dictation') return startDictation('', `${c.reason}/${reason}`);
+  return startRecording(reason, quick ? { quick: true } : {});
+}
+// A start without a tap was refused (normal on iOS). Abandon quietly; one tap anywhere starts instead.
+async function autoStartRefused(r, s) {
+  const rec = ui.rec;
+  if (!rec || rec.finishing) return;
+  rec.finishing = true;
+  clearInterval(rec.timer);
+  await r.stop();
+  ui.rec = null;
+  V.log('auto-start-refused', `${s.kind}:${s.error || s.reason || ''} ios=${P.isIOS} standalone=${P.isStandalone()}`);
+  go('tapstart', {}, 'replace');
+}
+
+function entryFromRecording(id, createdAt, res, extra = {}) {
+  return {
+    id, createdAt, dayKey: S.dayKey(createdAt), durationSec: res.durationSec,
+    segments: res.segments, rawVersion: 1, tidy: { ...tidy(res.segments), edited: false, fromRawVersion: 1 },
+    audioId: null, audioMime: null, audioNote: res.audioConflict || null, photoIds: [], restarts: res.restarts,
+    mic: res.micLabel || '', ...extra,
+  };
 }
 
 async function finishRecording(reason = 'stop') {
@@ -580,28 +716,37 @@ async function finishRecording(reason = 'stop') {
   if (st) st.textContent = 'שומר…';
   const res = await rec.r.stop();
   ui.rec = null;
+  const handsFree = reason === 'end-phrase' || reason === 'silence-stop';
   if (!res.segments.length && !res.audioBlob) {
     V.log('rec-empty', reason);
-    if (reason !== 'hidden') { toast('לא נקלט דיבור, ולכן לא נשמר כלום.'); go('today', {}, 'replace'); }
+    if (rec.car) VO.beep('stop');
+    if (reason !== 'hidden') { toast('לא נקלט דיבור, ולכן לא נשמר כלום.'); go(rec.quick ? 'quickDone' : 'today', {}, 'replace'); }
     return null;
   }
-  const id = V.uid();
-  const e = {
-    id, createdAt: rec.t0, dayKey: S.dayKey(rec.t0), durationSec: res.durationSec,
-    segments: res.segments, rawVersion: 1, tidy: { ...tidy(res.segments), edited: false, fromRawVersion: 1 },
-    audioId: null, audioMime: null, audioNote: res.audioConflict || null, photoIds: [], restarts: res.restarts,
-  };
-  if (res.audioBlob) { const a = await V.saveAudio(id, res.audioBlob, res.audioMime); e.audioId = a.id; e.audioMime = a.mime; }
-  await V.saveEntry(e);
-  V.log('rec-saved', `reason=${reason} segs=${res.segments.length} restarts=${res.restarts} audio=${res.audioState}${res.audioConflict ? ' conflict=' + res.audioConflict : ''}`);
-  if (reason !== 'hidden') go('entry', { entryId: id, entryTab: 'raw' }, 'replace');
-  return e;
+  const logLine = `reason=${reason} segs=${res.segments.length} restarts=${res.restarts} audio=${res.audioState}${res.audioConflict ? ' conflict=' + res.audioConflict : ''} mic=${res.micLabel ? 'named' : 'default'} trackToRecognizer=${res.trackToRecognizer}`;
+  if (rec.quick) {
+    // Locked: seal to the inbox public key. Nothing readable is written.
+    await V.addToInbox({ createdAt: rec.t0, durationSec: res.durationSec, segments: res.segments, restarts: res.restarts,
+      audioMime: res.audioMime || '', audioConflict: res.audioConflict || null, micLabel: res.micLabel || '', via: 'quick' }, res.audioBlob);
+    V.log('rec-saved-quick', logLine);
+  } else {
+    const id = V.uid();
+    const e = entryFromRecording(id, rec.t0, res);
+    if (res.audioBlob) { const a = await V.saveAudio(id, res.audioBlob, res.audioMime); e.audioId = a.id; e.audioMime = a.mime; }
+    await V.saveEntry(e);
+    V.log('rec-saved', logLine);
+    rec.entryId = id;
+  }
+  if (rec.car) { VO.beep('stop'); if (ui.settings.spokenCues) setTimeout(() => VO.sayShort('נשמר'), 450); }
+  if (reason === 'hidden') return null;
+  if (rec.quick) go('quickDone', {}, 'replace');
+  else go('entry', { entryId: rec.entryId, entryTab: handsFree ? 'tidy' : 'raw' }, 'replace');
+  return true;
 }
-
 // ---------------------------------------------------------------- keyboard dictation (iOS Home Screen app, or by choice)
 // Must be called inside a tap so the textarea can take focus and raise the keyboard.
 function startDictation(why = '', reason = 'chosen') {
-  ui.dict = { t0: Date.now(), marks: [], why };
+  ui.dict = { t0: Date.now(), marks: [], why, quick: !!ui.quick };
   V.log('rec-path', `dictation reason=${reason} ios=${P.isIOS} standalone=${P.isStandalone()}`);
   go('dictate');
   const ta = $('#dict-ta');
@@ -642,12 +787,88 @@ async function finishDictation(reason = 'stop') {
     segments, rawVersion: 1, tidy: { ...tidy(segments), edited: false, fromRawVersion: 1 },
     audioId: null, audioMime: null, audioNote: null, photoIds: [], restarts: 0, input: 'dictation',
   };
+  if (d.quick) {
+    await V.addToInbox({ createdAt: e.createdAt, durationSec: e.durationSec, segments, restarts: 0, via: 'quick' }, null);
+    V.log('dictation-saved-quick', `reason=${reason} segs=${segments.length}`);
+    if (reason !== 'hidden') go('quickDone', {}, 'replace');
+    return true;
+  }
   await V.saveEntry(e);
   V.log('dictation-saved', `reason=${reason} segs=${segments.length}`);
   if (reason !== 'hidden') go('entry', { entryId: id, entryTab: 'raw' }, 'replace');
   return e;
 }
 
+// ---------------------------------------------------------------- writing
+function openWrite(ctx) {
+  const d = ui.draft;
+  // An unsaved draft always wins, so nothing typed earlier is lost.
+  if (d && d.text && d.text.trim()) { ui.writeCtx = d.ctx || { mode: 'new' }; ui.writeText = d.text; ui.writeRestored = true; }
+  else { ui.writeCtx = ctx; ui.writeText = ''; ui.writeRestored = false; }
+  ui.writeFocused = false;
+  go('write');
+}
+function updateWriteCount() {
+  const el = $('#write-count');
+  if (el) el.textContent = `${(ui.writeText || '').length.toLocaleString('he-IL')} תווים`;
+}
+let draftTimer = null;
+function scheduleDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(saveDraftNow, 700);
+}
+async function saveDraftNow() {
+  clearTimeout(draftTimer);
+  if (!V.isUnlocked() || ui.screen !== 'write') return;
+  const text = ui.writeText || '';
+  ui.draft = { text, ctx: ui.writeCtx };
+  if (text.trim()) await V.saveDraft(ui.draft); else await V.clearDraft();
+  const st = $('#write-state');
+  if (st) st.textContent = 'טיוטה נשמרה ' + S.timeOf(Date.now());
+}
+async function saveWriting() {
+  const text = ($('#write-ta') || {}).value || ui.writeText || '';
+  const segs = writtenSegments(text);
+  if (!segs.length) { toast('אין מה לשמור.'); return; }
+  const ctx = ui.writeCtx || { mode: 'new' };
+  let id;
+  if (ctx.mode === 'append' && vault.entries.get(ctx.entryId)) {
+    const e = vault.entries.get(ctx.entryId);
+    pushUndo(e);
+    const lastT = e.segments.length ? e.segments[e.segments.length - 1].t || 0 : 0;
+    e.segments = e.segments.concat(segs.map((s) => ({ ...s, t: lastT })));
+    if (e.input !== 'written') e.written = true;
+    e.rawVersion = (e.rawVersion || 1) + 1;
+    if (!e.tidy.edited) e.tidy = { ...tidyFor(e), edited: false, fromRawVersion: e.rawVersion };
+    await V.saveEntry(e);
+    id = e.id;
+    V.log('write-append', 'chars=' + text.length);
+  } else {
+    id = V.uid();
+    const now = Date.now();
+    const e = { id, createdAt: now, dayKey: S.dayKey(now), durationSec: 0, segments: segs, rawVersion: 1, input: 'written',
+      tidy: { ...tidyWritten(segs), edited: false, fromRawVersion: 1 }, audioId: null, audioMime: null, audioNote: null, photoIds: [], restarts: 0 };
+    await V.saveEntry(e);
+    V.log('write-new', 'chars=' + text.length);
+  }
+  await V.clearDraft();
+  ui.draft = null;
+  ui.writeText = '';
+  go('entry', { entryId: id, entryTab: 'tidy' }, 'replace');
+  toast('נשמר.');
+}
+
+// The visible viewport shrinks when the iOS keyboard opens; the writing screen follows it.
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const fit = () => {
+    document.documentElement.style.setProperty('--vvh', vv.height + 'px');
+    document.documentElement.style.setProperty('--vvtop', vv.offsetTop + 'px');
+  };
+  vv.addEventListener('resize', fit);
+  vv.addEventListener('scroll', fit);
+  fit();
+}
 // ---------------------------------------------------------------- photos
 function getPosition() {
   return new Promise((res) => {
@@ -745,8 +966,21 @@ function withLocations(text, photos) {
   const locs = photos.filter((p) => p.lat != null).map((p, i) => `מיקום תמונה ${i + 1}: ${mapsUrl(p.lat, p.lng)}`);
   return locs.length ? `${text}\n\n${locs.join('\n')}` : text;
 }
-async function shareContent({ title, text, photos = [] }) {
+// Very long texts get cut by share targets (and by Android's intent size), so they go as a .txt file.
+async function shareLongText(title, full) {
+  const file = new File([full], 'yoman.txt', { type: 'text/plain' });
+  V.log('share-long', 'chars=' + full.length);
+  if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+    ui.external = true;
+    try { await navigator.share({ title, files: [file] }); V.log('share', 'long as file'); return; }
+    catch (e) { if (e.name === 'AbortError') return; V.log('share-failed', e.name); }
+    finally { setTimeout(() => { ui.external = false; }, 1500); }
+  }
+  downloadBlob(file, 'yoman.txt');
+  toast(`הטקסט ארוך (${full.length.toLocaleString('he-IL')} תווים), ולכן הוא נשמר כקובץ טקסט בהורדות במקום להישלח כהודעה.`, 7000);
+}async function shareContent({ title, text, photos = [] }) {
   const full = withLocations(text, photos);
+  if (full.length > SHARE_TEXT_MAX) return shareLongText(title, full);
   if (navigator.share) {
     const data = { title, text: full };
     if (photos.length) {
@@ -772,9 +1006,13 @@ let lastActivity = Date.now();
 
 async function doLock(reason) {
   if (!V.isUnlocked()) return;
+  if (ui.screen === 'write') { try { await saveDraftNow(); } catch (e) { V.log('draft-save-failed', e.message); } }
+  if (ui.reader) ui.reader.stop();
   V.lock();
   ui.undo.clear();
   ui.sd = null;
+  ui.quick = false;
+  ui.hasInbox = await V.hasInboxKey();
   ui.prfMeta = (await V.prfInfo()) || null;
   ui.hasPrf = !!ui.prfMeta;
   V.log('lock', reason);
@@ -785,6 +1023,17 @@ async function afterUnlock(how) {
   await refreshSettings();
   V.storageInfo().then((s) => { if (s.persisted === false) V.requestPersist().then((r) => V.log('persist-on-unlock', String(r))); });
   lastActivity = Date.now();
+  ui.quick = false;
+  ui.draft = await V.getDraft().catch(() => null);
+  ui.hasInbox = await V.hasInboxKey();
+  const n = await V.drainInbox(async (p, audio) => {
+    const id = V.uid();
+    const e = entryFromRecording(id, p.createdAt, { segments: p.segments || [], durationSec: p.durationSec || 0, restarts: p.restarts || 0, audioConflict: p.audioConflict, micLabel: p.micLabel }, { via: p.via || 'quick' });
+    if (audio && audio.length) { const a = await V.saveAudio(id, new Blob([audio], { type: p.audioMime || 'audio/mp4' }), p.audioMime); e.audioId = a.id; e.audioMime = a.mime; }
+    await V.saveEntry(e);
+  });
+  if (n) { V.log('inbox-drained', String(n)); toast(n === 1 ? 'הקלטה מהירה אחת נכנסה ליומן.' : `${n} הקלטות מהירות נכנסו ליומן.`); }
+  if (ui.pendingRec) { ui.pendingRec = false; go('today', {}, 'replace'); startRecording('rec-link-after-unlock', { auto: true }); return; }
   go('today', {}, 'replace');
 }
 
@@ -798,6 +1047,8 @@ let hiddenAt = 0;
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden) {
     hiddenAt = Date.now();
+    if (ui.rec && ui.rec.quick) { await finishRecording('hidden'); return; }
+    if (ui.dict && ui.dict.quick) { await finishDictation('hidden'); return; } // locked quick capture: seal what was said
     if (!V.isUnlocked() || ui.external) return;
     if (ui.rec) { await finishRecording('hidden'); }
     if (ui.dict) { await finishDictation('hidden'); }
@@ -809,6 +1060,51 @@ document.addEventListener('visibilitychange', async () => {
 });
 
 // ---------------------------------------------------------------- actions
+// ---------------------------------------------------------------- read aloud
+async function readAloud(src) {
+  if (!VO.ttsSupported()) { toast('הדפדפן הזה לא יודע להקריא.'); return; }
+  let title = '', text = '';
+  if (src === 'entry') {
+    const e = vault.entries.get(ui.entryId);
+    if (!e) return;
+    title = e.tidy.title;
+    text = e.tidy.paragraphs.join('\n');
+  } else {
+    title = periodLabel(ui.sumKind, ui.sumKey);
+    text = summaryText(ui.sumKind, ui.sumKey);
+  }
+  if (!text.trim()) { toast('אין מה להקריא.'); return; }
+  // Start speaking inside the tap when voices are already known (iOS needs the gesture).
+  if (!VO.hebrewVoices().length) await VO.waitForVoices();
+  const v = VO.pickVoice();
+  if (!v) { toast(P.isIOS ? 'לא נמצא קול עברי. אפשר להוסיף בהגדרות > נגישות > תוכן מוקרא > קולות > עברית.' : 'לא נמצא קול עברי בטלפון. אפשר להתקין "עברית" בהגדרות הטקסט לדיבור של אנדרואיד.', 9000); }
+  else if (!v.localService) { toast(`הקול העברי כאן נוצר בשרת של ${P.speechVendor}. הטקסט נשלח אליו כדי להקריא אותו.`, 7000); }
+  if (!ui.reader) ui.reader = new VO.Reader({ onState: () => renderPlayer() });
+  ui.reader.rate = ui.settings.ttsRate || 1;
+  ui.reader.load(text, title);
+  ui.reader.label = title;
+  ui.reader.play();
+  V.log('tts', `src=${src} voice=${v ? (v.localService ? 'local' : 'network') : 'none'}`);
+  renderPlayer();
+}
+
+function renderPlayer() {
+  const pl = $('#player');
+  const r = ui.reader;
+  if (!pl) return;
+  if (!r || (r.state === 'idle' && r.i === 0 && !r.chunks.length)) { pl.hidden = true; return; }
+  pl.hidden = false;
+  const playing = r.state === 'playing';
+  pl.innerHTML = `<div class="player-in">
+    <button class="round" data-pact="tts-toggle" aria-label="${playing ? 'השהה' : 'המשך'}">${playing ? '<span class="pause-ic" aria-hidden="true"></span>' : '<span class="play-ic" aria-hidden="true"></span>'}</button>
+    <div class="player-txt"><b>${esc(r.label || 'הקראה')}</b><span>${r.state === 'idle' ? 'הסתיים' : `קטע ${Math.min(r.i + 1, r.chunks.length)} מתוך ${r.chunks.length}`}</span></div>
+    <button class="chip" data-pact="tts-rate" aria-label="מהירות">×${ui.settings.ttsRate || 1}</button>
+    <button class="chip" data-pact="tts-stop">עצור</button></div>`;
+}
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('[data-pact]');
+  if (el) ACTIONS[el.dataset.pact](el, ev);
+});
 async function enrollFlow(el, fn) {
   try {
     const r = await busy(el, 'ממתין לאישור בטלפון…', fn);
@@ -846,7 +1142,38 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
   tab: (el) => { if (el.dataset.to === 'settings') ui.sd = null; go(el.dataset.to); },
   back: () => history.back(),
   record: () => { const c = chooseInputPath(); return c.mode === 'dictation' ? startDictation('', c.reason) : startRecording(c.reason); },
-  'retry-live': async () => { await V.setSettings({ speechFallback: null, inputMode: 'auto' }); await refreshSettings(); ui.sd = null; render(); toast('בהקלטה הבאה ננסה שוב תמלול חי.'); },
+  'write-new': () => openWrite({ mode: 'new' }),
+  'write-append': () => openWrite({ mode: 'append', entryId: ui.entryId }),
+  'write-save': (el) => busy(el, 'שומר…', saveWriting),
+  'write-cancel': async () => { await saveDraftNow(); const ctx = ui.writeCtx || {}; if ((ui.writeText || '').trim()) toast('הטיוטה נשמרה. היא תיפתח בפעם הבאה שתלחץ "כתוב".'); if (ctx.mode === 'append') go('entry', { entryId: ctx.entryId, entryTab: 'raw' }, 'replace'); else go('today', {}, 'replace'); },
+  'write-discard': async () => {
+    if (ui.confirm !== 'write-discard') { ui.confirm = 'write-discard'; ui.writeText = ($('#write-ta') || {}).value || ''; render(); return; }
+    await V.clearDraft(); ui.draft = null; ui.writeText = ''; ui.confirm = null; ui.writeRestored = false; ui.writeFocused = false; render();
+  },
+  'more-words': () => { ui.wordLimit = (ui.wordLimit || WORD_PAGE) + WORD_PAGE; render(); },
+  'fs-toggle': (el) => { const f = el.closest('form'); if (!f) return; f.classList.toggle('fs'); el.textContent = f.classList.contains('fs') ? 'צמצם' : 'מסך מלא'; const ta = f.querySelector('textarea'); if (ta) { if (f.classList.contains('fs')) ta.style.height = ''; else grow(ta); ta.focus(); } },  'tap-start': () => startAny('tap-after-refused-auto', !V.isUnlocked()),
+  'quick-rec': () => startAny('quick-button', true),
+  'quick-exit': () => { ui.quick = false; go('lock', {}, 'replace'); },
+  'tts-play': (el) => readAloud(el.dataset.src),
+  'tts-toggle': () => { const r = ui.reader; if (!r) return; if (r.state === 'playing') r.pause(); else if (r.state === 'paused') r.resume(); else r.play(); },
+  'tts-stop': () => { if (ui.reader) ui.reader.stop(); const pl = $('#player'); if (pl) pl.hidden = true; },
+  'tts-rate': async () => {
+    const rates = [0.8, 1, 1.25, 1.5];
+    const next = rates[(rates.indexOf(ui.settings.ttsRate || 1) + 1) % rates.length];
+    await V.setSettings({ ttsRate: next }); await refreshSettings();
+    if (ui.reader) ui.reader.setRate(next);
+    renderPlayer();
+  },
+  'mics-load': async () => {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true }); // labels appear only after permission
+      s.getTracks().forEach((t) => t.stop());
+      ui.mics = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput');
+      V.log('mics', String(ui.mics.length));
+    } catch (e) { toast('לא הצלחתי לקבל את רשימת המיקרופונים: ' + (e.name || e.message)); }
+    ui.sd = null; render();
+  },
+  'copy-quick-url': async () => { const ok = await copyText(QUICK_URL); toast(ok ? 'הכתובת הועתקה.' : 'ההעתקה לא הצליחה. אפשר לסמן את הכתובת ולהעתיק.'); },  'retry-live': async () => { await V.setSettings({ speechFallback: null, inputMode: 'auto' }); await refreshSettings(); ui.sd = null; render(); toast('בהקלטה הבאה ננסה שוב תמלול חי.'); },
   'stop-dict': (el) => { el.disabled = true; finishDictation('stop'); },
   'rec-resume': (el) => { el.hidden = true; if (ui.rec) ui.rec.r.resume(); const st = $('#rec-status'); if (st) st.textContent = 'מקשיב…'; },
   'stop-rec': (el) => { el.disabled = true; finishRecording('stop'); },
@@ -1053,7 +1380,12 @@ const FORMS = {
 const CHANGES = {
   autolock: async (el) => { await V.setSettings({ autolockMin: +el.value }); await refreshSettings(); toast(`נעילה אחרי ${el.value} דקות.`); },
   'rec-audio': async (el) => { await V.setSettings({ recordAudio: el.checked }); await refreshSettings(); },
-  'input-mode': async (el) => { await V.setSettings({ inputMode: el.value, ...(el.value === 'auto' ? { speechFallback: null } : {}) }); await refreshSettings(); },
+  'car-mode': async (el) => { await V.setSettings({ carMode: el.checked }); await refreshSettings(); ui.sd = null; render(); },
+  'end-phrase': async (el) => { await V.setSettings({ endPhrase: el.value.trim() }); await refreshSettings(); toast(el.value.trim() ? `מילת הסיום: "${el.value.trim()}"` : 'מילת הסיום כבויה.'); },
+  'silence-stop': async (el) => { await V.setSettings({ silenceStopSec: +el.value }); await refreshSettings(); },
+  'spoken-cues': async (el) => { await V.setSettings({ spokenCues: el.checked }); await refreshSettings(); },
+  mic: async (el) => { await V.setSettings({ micDeviceId: el.value }); await refreshSettings(); toast(el.value ? 'המיקרופון נבחר. הוא ישמש להקלטת הקול, ואם הדפדפן מאפשר, גם לתמלול.' : 'חזרה למיקרופון ברירת המחדל.'); },
+  'quick-capture': async (el) => { await V.setSettings({ quickCapture: el.checked }); await refreshSettings(); V.log('quick-capture', String(el.checked)); },  'input-mode': async (el) => { await V.setSettings({ inputMode: el.value, ...(el.value === 'auto' ? { speechFallback: null } : {}) }); await refreshSettings(); },
   'audio-keep': async (el) => { await V.setAudioKeep(el.dataset.id, el.checked); render(); toast(el.checked ? 'הקול יישמר לתמיד.' : 'הקול יימחק 30 יום אחרי ההקלטה.'); },
 };
 
@@ -1070,6 +1402,8 @@ app.addEventListener('submit', (ev) => {
   if (fn) Promise.resolve(fn(form, form.querySelector('[type=submit]'))).catch((e) => { V.log('form-failed', `${form.dataset.form}: ${e.message}`); showErr(form, 'משהו נכשל: ' + e.message); });
 });
 app.addEventListener('input', (ev) => {
+  if (ev.target.id === 'write-ta') { ui.writeText = ev.target.value; updateWriteCount(); scheduleDraft(); lastActivity = Date.now(); return; }
+  if (ev.target.classList && ev.target.classList.contains('grow') && !ev.target.closest('form.fs')) grow(ev.target);
   if (ev.target.id === 'dict-ta' && ui.dict) { ui.dict.marks.push({ len: ev.target.value.length, t: Date.now() - ui.dict.t0 }); lastActivity = Date.now(); }
 });
 app.addEventListener('change', (ev) => {
@@ -1089,7 +1423,20 @@ async function boot() {
   await refreshSettings();
   ui.prfMeta = (await V.prfInfo()) || null;
   ui.hasPrf = !!ui.prfMeta;
+  ui.hasInbox = await V.hasInboxKey();
+  VO.waitForVoices();
+  document.body.insertAdjacentHTML('beforeend', '<div id="player" class="player" hidden></div>');
+  // ?rec=1 (Siri shortcut / home-screen shortcut): start recording right away. Remove it from the address first.
+  const wantRec = new URLSearchParams(location.search).get('rec') === '1';
+  if (wantRec) history.replaceState(null, '', location.pathname);
+  if (wantRec && ui.hasVault && ui.settings.quickCapture && ui.hasInbox) {
+    ui.quick = true;
+    V.log('rec-link', 'quick capture while locked');
+    startRecording('rec-link', { quick: true, auto: true });
+    return;
+  }
+  if (wantRec && ui.hasVault) { ui.pendingRec = true; V.log('rec-link', 'locked, recording starts after unlock'); }
   go(ui.hasVault ? 'lock' : 'setup', {}, 'replace');
 }
-if (TEST_DB) window.__app = { V, ui, go, render, S };
+if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE };
 boot();

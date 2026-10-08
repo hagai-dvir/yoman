@@ -3,8 +3,8 @@
 const qp = new URLSearchParams(location.search).get('db');
 export const TEST_DB = (qp && /^test-[\w-]+$/.test(qp) ? qp : null) || globalThis.__HAMESADER_DB__ || null;
 const DB_NAME = TEST_DB || 'hamesader';
-const DB_VERSION = 1;
-export const STORES = ['meta', 'entries', 'photos', 'blobs', 'audio', 'summaries'];
+const DB_VERSION = 2; // v2 adds 'inbox' (quick capture while locked)
+export const STORES = ['meta', 'entries', 'photos', 'blobs', 'audio', 'summaries', 'inbox'];
 
 let dbPromise = null;
 

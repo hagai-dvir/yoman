@@ -18,7 +18,8 @@ export const isUnlocked = () => !!vault.key;
 export const uid = () => Date.now().toString(36) + '-' + C.toB64(C.rand(9)).replace(/[+/=]/g, '').slice(0, 10);
 
 // ---------- settings & diagnostics (plain, no content) ----------
-const DEFAULT_SETTINGS = { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, speechFallback: null };
+const DEFAULT_SETTINGS = { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, speechFallback: null,
+  carMode: false, endPhrase: 'סיום הקלטה', silenceStopSec: 0, spokenCues: true, micDeviceId: '', ttsRate: 1 };
 export async function getSettings() {
   const s = await db.get('meta', 'settings');
   return { ...DEFAULT_SETTINGS, ...(s || {}) };
@@ -98,6 +99,65 @@ async function loadWithKey(dek) {
   for (const r of await db.getAll('summaries')) vault.summaries.set(r.id, await C.decryptJSON(dek, r.enc, 'summaries:' + r.id));
   for (const r of await db.getAll('audio')) vault.audio.set(r.id, { id: r.id, entryId: r.entryId, createdAt: r.createdAt, keep: r.keep, size: r.size });
   await purgeAudio();
+  await ensureInboxKeys();
+}
+
+// ---------- quick-capture inbox (write while locked, read only after unlock) ----------
+// The public key is stored in the clear so a locked diary can seal new recordings to it.
+// The private key is stored only encrypted under the data key. A copy of the public key is also kept
+// inside the encrypted record, so a swapped public key (someone with access to the device storage)
+// is detected on the next unlock and replaced.
+async function ensureInboxKeys() {
+  const pub = await db.get('meta', 'inbox-pub');
+  const sec = await db.get('meta', 'inbox-sec');
+  if (pub && sec) {
+    const s = await C.decryptJSON(vault.key, sec.enc, 'meta:inbox-sec');
+    if (JSON.stringify(s.publicJwk) === JSON.stringify(pub.jwk)) return;
+    await log('inbox-key-mismatch', 'public key changed outside the app; replaced');
+  }
+  const kp = await C.newInboxKeyPair();
+  await db.put('meta', { id: 'inbox-sec', enc: await C.encryptJSON(vault.key, { publicJwk: kp.publicJwk, privateB64: C.toB64(kp.privatePkcs8) }, 'meta:inbox-sec') });
+  await db.put('meta', { id: 'inbox-pub', jwk: kp.publicJwk, created: Date.now() });
+}
+
+export async function hasInboxKey() {
+  return !!(await db.get('meta', 'inbox-pub'));
+}
+
+export async function inboxCount() {
+  return (await db.getAll('inbox')).length;
+}
+
+// payload: { createdAt, durationSec, segments, restarts, via, audioMime? }  audioBlob optional.
+export async function addToInbox(payload, audioBlob) {
+  const pub = await db.get('meta', 'inbox-pub');
+  if (!pub) throw Object.assign(new Error('no-inbox-key'), { code: 'no-inbox-key' });
+  const id = uid();
+  const parts = [C.utf8.enc(JSON.stringify(payload))];
+  if (audioBlob) parts.push(new Uint8Array(await audioBlob.arrayBuffer()));
+  const box = await C.seal(pub.jwk, parts, 'inbox:' + id);
+  await db.put('inbox', { id, createdAt: payload.createdAt, box });
+  return id;
+}
+
+// After unlock: open every inbox item, hand it to makeEntry(payload, audio), then delete it.
+export async function drainInbox(makeEntry) {
+  const items = await db.getAll('inbox');
+  if (!items.length) return 0;
+  const sec = await C.decryptJSON(vault.key, (await db.get('meta', 'inbox-sec')).enc, 'meta:inbox-sec');
+  const priv = C.fromB64(sec.privateB64);
+  let n = 0;
+  for (const it of items) {
+    try {
+      const [json, audio] = await C.unseal(priv, it.box, 'inbox:' + it.id);
+      await makeEntry(JSON.parse(C.utf8.dec(json)), audio || null);
+      await db.del('inbox', it.id);
+      n++;
+    } catch (e) {
+      await log('inbox-open-failed', e.name || e.message); // kept for a later attempt, never silently dropped
+    }
+  }
+  return n;
 }
 
 export function lock() {
@@ -265,3 +325,13 @@ export async function storageInfo() {
 export async function requestPersist() {
   try { return navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : null; } catch (e) { return null; }
 }
+
+// ---------- writing draft (encrypted, autosaved while typing) ----------
+export async function saveDraft(draft) {
+  await db.put('meta', { id: 'draft', enc: await C.encryptJSON(vault.key, { ...draft, savedAt: Date.now() }, 'meta:draft') });
+}
+export async function getDraft() {
+  const r = await db.get('meta', 'draft');
+  return r ? C.decryptJSON(vault.key, r.enc, 'meta:draft') : null;
+}
+export const clearDraft = () => db.del('meta', 'draft');

@@ -228,3 +228,38 @@ input, textarea, select { font-size: max(16px, 1em); } /* iOS zooms into fields 
 .nav button { font-size: 13px; }
 .nav .rec { width: 48px; height: 48px; margin-top: 0; box-shadow: none; }
 .nav .rec .ic { width: 24px; height: 24px; }
+/* ---------- v1.3: car mode, quick capture, read-aloud ---------- */
+.rec-mic { font-size: 14px; color: var(--muted); }
+.handsfree { background: var(--dgreen); color: var(--paper); border-radius: 14px; padding: 10px 14px; font-size: 17px; text-align: center; }
+.quick-badge { background: var(--honey); color: var(--fg); border-radius: 14px; padding: 8px 12px; font-size: 15px; text-align: center; }
+.stop.huge { width: min(70vw, 260px); height: min(70vw, 260px); }
+.stop.huge i { width: 64px; height: 64px; border-radius: 12px; }
+.car .stop-l { font-size: 30px; }
+.car .rec-text { min-height: 140px; max-height: 32dvh; }
+.tapstart { padding: 0; }
+.tap-all { flex: 1; width: 100%; min-height: 100dvh; border: 0; background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: 24px; text-align: center; color: var(--fg); }
+.tap-all .note { max-width: 30ch; }
+.quick-btn { margin-top: 4px; }
+.url-box { font-family: ui-monospace, Consolas, monospace; font-size: 13px; background: var(--paper2); border-radius: 10px; padding: 8px 10px; overflow-wrap: anywhere; user-select: all; }
+.player { position: fixed; z-index: 30; inset-inline: 0; bottom: calc(env(safe-area-inset-bottom, 0px) + var(--nav-h)); display: flex; justify-content: center; padding: 0 10px 8px; pointer-events: none; }
+.player-in { pointer-events: auto; width: 100%; max-width: 540px; background: var(--dgreen); color: var(--paper); border-radius: 20px; padding: 8px 10px; display: flex; align-items: center; gap: 10px; box-shadow: 0 10px 24px -10px rgba(0, 0, 0, .5); }
+.player-txt { flex: 1; min-width: 0; display: flex; flex-direction: column; font-size: 13px; }
+.player-txt b { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.player .round { width: 50px; height: 50px; }
+.player .chip { min-height: 36px; padding: 0 10px; }
+.play-ic { width: 0; height: 0; border-block: 10px solid transparent; border-inline-end: 16px solid var(--dgreen); margin-inline-start: 4px; }
+[dir="rtl"] .play-ic { border-inline-end: 0; border-inline-start: 0; border-left: 16px solid var(--dgreen); }
+.pause-ic { width: 16px; height: 18px; border-inline: 5px solid var(--dgreen); }
+/* ---------- v1.4: writing ---------- */
+.write-btn { min-height: 48px; font-size: 18px; margin-top: 6px; }
+.write-scr { position: fixed; z-index: 40; inset-inline: 0; top: var(--vvtop, 0px); height: var(--vvh, 100dvh); display: flex; flex-direction: column; background: var(--paper); padding-top: env(safe-area-inset-top, 0px); }
+.write-bar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 2px solid var(--line); }
+.write-bar .btn { min-height: 44px; padding: 0 18px; }
+.write-mid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.write-mid b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dgreen); }
+.write-ta { flex: 1; width: 100%; border: 0; resize: none; padding: 14px 16px; background: var(--paper); color: var(--fg); font-family: var(--f-body); font-size: 18px; line-height: 1.7; outline: none; }
+.write-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 12px calc(env(safe-area-inset-bottom, 0px) + 6px); border-top: 2px solid var(--line); }
+textarea.grow { min-height: 40dvh; overflow: hidden; resize: none; }
+form.fs { position: fixed; z-index: 45; inset-inline: 0; top: var(--vvtop, 0px); height: var(--vvh, 100dvh); margin: 0; padding: calc(env(safe-area-inset-top, 0px) + 10px) 12px 10px; background: var(--paper); display: flex !important; flex-direction: column; gap: 8px; }
+form.fs label.field { flex: 1; min-height: 0; }
+form.fs textarea { flex: 1; min-height: 0 !important; height: auto !important; overflow: auto !important; }

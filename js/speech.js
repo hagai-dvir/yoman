@@ -4,6 +4,7 @@
 // the recorder is stopped, the event is logged and the UI is told. Nothing is dropped silently.
 
 import { audioMimeCandidates } from './platform.js';
+import { endsWithPhrase, stripEndPhrase } from './tidy.js';
 
 export function speechSupported() {
   return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
@@ -27,8 +28,11 @@ export function dedupeFinals(finals) {
 }
 
 export class Recorder {
-  constructor({ lang = 'he-IL', withAudio = true, onUpdate = () => {}, onStatus = () => {}, log = () => {} } = {}) {
-    Object.assign(this, { lang, withAudio, onUpdate, onStatus, log });
+  // endPhrase / silenceStopMs: hands-free stopping, only passed when the owner turned on car mode.
+  // deviceId: a chosen microphone (Android); recognition then tries to listen to that same track.
+  constructor({ lang = 'he-IL', withAudio = true, onUpdate = () => {}, onStatus = () => {}, log = () => {},
+    endPhrase = '', silenceStopMs = 0, deviceId = '' } = {}) {
+    Object.assign(this, { lang, withAudio, onUpdate, onStatus, log, endPhrase, silenceStopMs, deviceId });
     this.segments = [];        // committed: [{ text, t }]
     this.sessionFinals = [];   // raw finals of the running recognition session
     this.sessionTimes = [];
@@ -50,6 +54,18 @@ export class Recorder {
     this.t0 = Date.now();
     this.running = true;
     this.requestWakeLock();
+    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) { /* Safari 16.4+ only */ }
+    this.lastChange = Date.now();
+    if (this.silenceStopMs) {
+      this.silenceTimer2 = setInterval(() => {
+        if (!this.stopping && !this.handsFreeFired && Date.now() - this.lastChange > this.silenceStopMs) {
+          this.handsFreeFired = true;
+          this.log('auto-stop', 'silence ' + Math.round(this.silenceStopMs / 1000) + 's');
+          this.onStatus({ kind: 'silence-stop' });
+        }
+      }, 1000);
+    }
+    if (this.deviceId && this.withAudio) await this.startAudio(); // chosen mic first, so recognition can use its track
     this.startRecognition();
     // If recognition never starts (iOS Home Screen web apps: API present but inert), report it
     // so the UI can switch to keyboard dictation instead of showing an empty page forever.
@@ -60,7 +76,7 @@ export class Recorder {
       }
     }, 4500);
     // Give the recognizer the microphone first; start the recorder once recognition reports audio.
-    if (this.withAudio) {
+    if (this.withAudio && !this.recorder) {
       this.audioTimer = setTimeout(() => this.startAudio(), 1200);
     }
   }
@@ -86,6 +102,7 @@ export class Recorder {
     this.sessionStart = Date.now();
     r.onresult = (ev) => {
       this.gotResultInSession = true;
+      this.lastChange = Date.now();
       const finals = [];
       let interim = '';
       for (let i = 0; i < ev.results.length; i++) {
@@ -148,7 +165,10 @@ export class Recorder {
     };
     this.rec = r;
     try {
-      r.start();
+      const tr = this.deviceId && this.stream ? this.stream.getAudioTracks()[0] : null;
+      if (tr) {
+        try { r.start(tr); this.trackToRecognizer = true; } catch (e2) { this.log('recognizer-track-unsupported', e2.name); r.start(); }
+      } else r.start();
     } catch (e) {
       this.log('speech-start-threw', e.name || e.message);
       if (this.everStarted) { this.paused = true; this.onStatus({ kind: 'need-tap' }); }
@@ -174,12 +194,26 @@ export class Recorder {
     return { finalText: [...committed, ...live].join(' '), interim: this.interim };
   }
 
-  emit() { this.onUpdate(this.currentText()); }
+  emit() {
+    const cur = this.currentText();
+    this.onUpdate(cur);
+    if (this.endPhrase && !this.handsFreeFired && endsWithPhrase(cur.finalText + ' ' + cur.interim, this.endPhrase)) {
+      this.handsFreeFired = true;
+      this.log('auto-stop', 'end phrase');
+      this.onStatus({ kind: 'end-phrase' });
+    }
+  }
 
   async startAudio() {
     if (this.stopping || !this.withAudio) return;
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      const constraints = { echoCancellation: true, noiseSuppression: true };
+      if (this.deviceId) constraints.deviceId = { exact: this.deviceId };
+      try { this.stream = await navigator.mediaDevices.getUserMedia({ audio: constraints }); }
+      catch (e) { if (!this.deviceId) throw e; this.log('mic-choice-failed', e.name); delete constraints.deviceId; this.stream = await navigator.mediaDevices.getUserMedia({ audio: constraints }); }
+      const tr = this.stream.getAudioTracks()[0];
+      this.micLabel = (tr && tr.label) || '';
+      this.onStatus({ kind: 'mic', label: this.micLabel });
       const mime = audioMimeCandidates().find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
       this.recorder = new MediaRecorder(this.stream, mime ? { mimeType: mime, audioBitsPerSecond: 32000 } : undefined);
       this.audio.mime = this.recorder.mimeType || mime;
@@ -232,6 +266,7 @@ export class Recorder {
 
   stopAudio(keep = true) {
     clearInterval(this.silenceTimer);
+    clearInterval(this.silenceTimer2);
     clearTimeout(this.watchdog);
     clearTimeout(this.audioTimer);
     if (this.actx) { this.actx.close().catch(() => {}); this.actx = null; }
@@ -257,9 +292,15 @@ export class Recorder {
     if (this.running) { this.commitSession(); this.running = false; } // onend never came
     await this.stopAudio(true);
     this.releaseWakeLock();
+    clearInterval(this.silenceTimer2);
+    try { if (navigator.audioSession) navigator.audioSession.type = 'auto'; } catch (e) { /* ignore */ }
+    let segments = this.segments.filter((s) => s.text.trim());
+    if (this.endPhrase) segments = stripEndPhrase(segments, this.endPhrase);
     const audioBlob = this.audio.chunks.length ? new Blob(this.audio.chunks, { type: this.audio.mime || 'audio/webm' }) : null;
     return {
-      segments: this.segments.filter((s) => s.text.trim()),
+      segments,
+      micLabel: this.micLabel || '',
+      trackToRecognizer: !!this.trackToRecognizer,
       durationSec: Math.round(this.elapsed() / 1000),
       restarts: this.restarts,
       audioBlob,

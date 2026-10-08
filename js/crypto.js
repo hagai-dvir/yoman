@@ -101,3 +101,42 @@ export async function gunzip(u8) {
 }
 
 export const utf8 = { enc: (s) => te.encode(s), dec: (b) => td.decode(b) };
+
+// ---- Quick-capture inbox: sealed boxes to a public key (ECDH P-256 + HKDF-SHA256 + AES-GCM) ----
+// Anyone holding the public key can write; only the private key (stored encrypted under the DEK) can read.
+const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
+
+export async function newInboxKeyPair() {
+  const kp = await crypto.subtle.generateKey(ECDH, true, ['deriveBits']);
+  return {
+    publicJwk: await crypto.subtle.exportKey('jwk', kp.publicKey),
+    privatePkcs8: new Uint8Array(await crypto.subtle.exportKey('pkcs8', kp.privateKey)),
+  };
+}
+
+async function boxKey(privateKey, publicKey, salt) {
+  const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: publicKey }, privateKey, 256);
+  const base = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt, info: te.encode('hamesader-inbox-v1') },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+// Returns { epk, salt, parts: [{iv, ct}, ...] } — one ephemeral key per sealed message, several parts allowed.
+export async function seal(publicJwk, partsBytes, aad) {
+  const recipient = await crypto.subtle.importKey('jwk', publicJwk, ECDH, false, []);
+  const eph = await crypto.subtle.generateKey(ECDH, true, ['deriveBits']);
+  const salt = rand(16);
+  const key = await boxKey(eph.privateKey, recipient, salt);
+  const parts = [];
+  for (let i = 0; i < partsBytes.length; i++) parts.push(await encryptBytes(key, partsBytes[i], `${aad}:${i}`));
+  return { epk: await crypto.subtle.exportKey('jwk', eph.publicKey), salt, parts };
+}
+
+export async function unseal(privatePkcs8, box, aad) {
+  const priv = await crypto.subtle.importKey('pkcs8', privatePkcs8, ECDH, false, ['deriveBits']);
+  const eph = await crypto.subtle.importKey('jwk', box.epk, ECDH, false, []);
+  const key = await boxKey(priv, eph, box.salt);
+  const out = [];
+  for (let i = 0; i < box.parts.length; i++) out.push(await decryptBytes(key, box.parts[i], `${aad}:${i}`));
+  return out;
+}

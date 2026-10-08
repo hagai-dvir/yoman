@@ -152,3 +152,47 @@ export function dictationSegments(text, marks) {
   }
   return segs;
 }
+
+// ---- hands-free end phrase (e.g. "סיום הקלטה") ----
+const phraseTokens = (p) => tokenize(p || '').map(norm).filter(Boolean);
+
+// True when the spoken text ends with the end phrase.
+export function endsWithPhrase(text, phrase) {
+  const p = phraseTokens(phrase);
+  if (!p.length) return false;
+  const t = tokenize(text || '').map(norm).filter(Boolean);
+  if (t.length < p.length) return false;
+  return p.every((w, i) => t[t.length - p.length + i] === w);
+}
+
+// Removes the end phrase from the end of the segments (it may be split across the last two segments).
+export function stripEndPhrase(segments, phrase) {
+  const p = phraseTokens(phrase);
+  if (!p.length) return segments;
+  const segs = segments.map((s) => ({ ...s }));
+  let remaining = p.length;
+  const flat = segs.flatMap((s) => tokenize(s.text)).map(norm).filter(Boolean);
+  if (!endsWithPhrase(flat.join(' '), phrase)) return segments;
+  for (let i = segs.length - 1; i >= 0 && remaining > 0; i--) {
+    const words = tokenize(segs[i].text);
+    // drop trailing empty-after-normalising tokens (punctuation) together with the phrase words
+    while (words.length && remaining > 0) {
+      const w = words.pop();
+      if (norm(w)) remaining--;
+    }
+    segs[i].text = words.join(' ');
+  }
+  return segs.filter((s) => s.text.trim());
+}
+// ---- written text (typed, not spoken) ----
+// One segment per paragraph the owner wrote, so his own paragraph breaks survive.
+export function writtenSegments(text, t = 0) {
+  return (text || '').replace(/\r/g, '').split(/\n\s*\n+/).map((p) => p.replace(/\s*\n\s*/g, ' ').replace(/[ \t]+/g, ' ').trim()).filter(Boolean).map((p) => ({ text: p, t }));
+}
+// Tidy each written paragraph on its own: fillers and repeats are cleaned, paragraph breaks are kept.
+export function tidyWritten(segments) {
+  const paragraphs = [];
+  for (const s of segments) paragraphs.push(...tidy([{ text: s.text, t: 0 }]).paragraphs);
+  const first = paragraphs.length ? (paragraphs[0].match(/[^.!?]+[.!?]?/) || [''])[0] : '';
+  return { title: makeTitle(first), paragraphs };
+}
