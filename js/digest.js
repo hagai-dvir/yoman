@@ -14,7 +14,8 @@ const STOP = new Set(('אני אתה את הוא היא אנחנו אתם הם �
 // Words that open a spoken sentence without adding content. Dropped only at the start of a digest line.
 const LEAD_FILLERS = new Set(['אז', 'ואז', 'טוב', 'אוקיי', 'בקיצור', 'נו', 'בעצם', 'וגם', 'כאילו', 'יעני']);
 
-export const DIGEST_DEFAULTS = { maxItems: 7, maxChars: 650, longWords: 22, takeAllWords: 45 };
+// maxItems: null = about a third of the day's sentences, between 3 and 7 lines.
+export const DIGEST_DEFAULTS = { maxItems: null, maxChars: 600, longWords: 22, takeAllWords: 45 };
 
 const bare = (w) => w.replace(PUNCT, '');
 
@@ -95,6 +96,7 @@ export function digestDay(items, opts = {}) {
   const srcWords = cands.reduce((n, c) => n + c.words, 0);
   const stats = { entries: sorted.length, written: sorted.filter((x) => x.input === 'written').length, sentences: cands.length, srcWords, outWords: 0, chosen: 0, method: 'local-extractive' };
   if (!cands.length) return { text: '', items: [], stats };
+  if (!o.maxItems) o.maxItems = Math.min(7, Math.max(3, Math.ceil(cands.length / 3)));
 
   // How many sentences talk about each word. Words the day keeps coming back to are its topics.
   const df = new Map();

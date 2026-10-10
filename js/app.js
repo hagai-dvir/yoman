@@ -12,8 +12,9 @@ import * as P from './platform.js';
 import * as VO from './voice.js';
 import { WakeKeeper } from './wake.js';
 import { digestDay, browserSummarizer } from './digest.js';
+import { Updater } from './updater.js';
 
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 const JOURNAL_TEXT_MS = 8000;   // how often the transcript of a running recording is written to the crash-safe journal
 const wake = new WakeKeeper({ log: (ev, d) => V.log(ev, d) });
 const WORD_PAGE = 1500;        // word buttons rendered at once in the raw view (100K-character entries stay fast)
@@ -84,7 +85,39 @@ function render() {
   const wi = $('#word-input');
   if (wi) { wi.focus(); if (ui.word && ui.word.mode !== 'add') wi.select(); }
   updateWake();
+  renderUpdateBar();
 }
+
+// ---------------------------------------------------------------- version updates
+// Busy = something unsaved could be lost by a reload: a recording, dictation, the writing screen, an open edit form,
+// or a share sheet / picker in progress. The update bar waits until none of these is true.
+const updateBusy = () => !!(ui.rec || ui.dict || ui.external || ui.sumEdit || ui.freeEdit || ui.tidyEdit || ui.word
+  || ['record', 'dictate', 'tapstart', 'write', 'boot'].includes(ui.screen));
+const updater = new Updater({ current: VERSION, isBusy: updateBusy, onChange: () => renderUpdateBar(), log: (ev, d) => V.log(ev, d) });
+function renderUpdateBar() {
+  let bar = document.getElementById('update-bar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'update-bar'; bar.className = 'update-bar'; bar.setAttribute('role', 'status'); bar.hidden = true;
+    bar.addEventListener('click', (ev) => { if (ev.target.closest('[data-upd="now"]')) applyUpdate(); });
+    document.body.appendChild(bar);
+  }
+  const show = updater.available && !updateBusy();
+  if (show) {
+    const html = `<span>יש גרסה חדשה${updater.newVersion ? ` (${esc(updater.newVersion)})` : ''}</span><button class="btn honey" data-upd="now">${icon('download')}עדכן עכשיו</button>`;
+    if (bar.dataset.html !== html) { bar.innerHTML = html; bar.dataset.html = html; }
+  }
+  bar.hidden = !show;
+  document.body.classList.toggle('has-update', show);
+}
+function applyUpdate() {
+  const r = updater.apply();
+  if (r === 'busy') toast('קודם סיים את מה שפתוח. העדכון יחכה.');
+  else if (r === 'applying') toast('מעדכן… היומן ייטען מחדש, נעול כרגיל.', 8000);
+  return r;
+}
+function checkUpdatesQuietly() { updater.check().then(renderUpdateBar).catch(() => {}); }
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkUpdatesQuietly(); });
 
 // Screen stays on: while recording/dictating (unless turned off), and by default whenever the diary is
 // open and unlocked. Never on the lock screen, so a forgotten phone still goes dark after the diary locks.
@@ -608,6 +641,13 @@ const SCREENS = {
           <li>כשאתה לוחץ על קישור מפה: גוגל מפות נפתח עם הנקודה.</li>
           <li>שום דבר אחר. האתר חסום מלשלוח נתונים לכל כתובת.</li></ul>
       </details>
+      <section class="card upd-card"><h2>גרסה ועדכונים</h2>
+        <p>הגרסה שלך: <b dir="ltr">${VERSION}</b></p>
+        ${updater.available ? `<p class="notice">יש גרסה חדשה${updater.newVersion ? ` (<span dir="ltr">${esc(updater.newVersion)}</span>)` : ''}, מוכנה להתקנה.</p>` : ''}
+        <button class="btn wide" data-act="check-update">${icon('download')}${updater.available ? 'עדכן עכשיו' : 'בדוק עדכונים'}</button>
+        <p class="note" id="upd-msg" aria-live="polite"></p>
+        <p class="note">העדכון לא נוגע ביומן עצמו: הכול נשאר מוצפן בטלפון. אחרי העדכון היומן נפתח נעול, כרגיל.</p>
+      </section>
       <details class="card"><summary>אבחון</summary>
         <dl class="kv"><dt>גרסה</dt><dd>${VERSION}</dd>
           <dt>זיהוי דיבור</dt><dd>${speechSupported() ? 'נתמך' : 'לא נתמך'}</dd>
@@ -1443,6 +1483,17 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
   'sum-edit': () => { ui.sumEdit = true; render(); },
   'sum-cancel': () => { ui.sumEdit = false; render(); },
   'sum-rebuild': () => { ui.confirm = 'sum-rebuild'; render(); },
+  'check-update': async (el) => {
+    const msg = (t) => { const m = $('#upd-msg'); if (m) m.textContent = t; };
+    msg('');
+    const r = updater.available ? 'available' : await busy(el, 'בודק…', () => updater.check({ force: true }));
+    renderUpdateBar();
+    if (r === 'available') {
+      if (applyUpdate() === 'none') msg('לא הצלחתי להתחיל את העדכון. נסה שוב.');
+    } else if (r === 'latest') msg(`יש לך את הגרסה האחרונה (${VERSION}).`);
+    else if (r === 'unsupported') msg('בדפדפן הזה אין בדיקת עדכונים (אין service worker).');
+    else msg('לא הצלחתי לבדוק. אולי אין חיבור לאינטרנט.');
+  },
   // A summary the owner edited is never replaced without his explicit "החלף בתקציר".
   'digest-day': async (el) => {
     const key = el.dataset.key || ui.sumKey || today();
@@ -1647,7 +1698,13 @@ app.addEventListener('keydown', (ev) => {
 // ---------------------------------------------------------------- boot
 async function boot() {
   buildKoru(document.getElementById('sprite'));
-  if ('serviceWorker' in navigator && !TEST_DB) navigator.serviceWorker.register('./sw.js').catch((e) => V.log('sw-failed', e.message));
+  // updateViaCache 'none': the browser never answers an update check from its HTTP cache.
+  if ('serviceWorker' in navigator && !TEST_DB) {
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+      .then((reg) => { updater.attach(navigator.serviceWorker, reg); return updater.check({ force: true }); })
+      .then(renderUpdateBar)
+      .catch((e) => V.log('sw-failed', e.message));
+  }
   ui.hasVault = await V.hasVault();
   await refreshSettings();
   ui.prfMeta = (await V.prfInfo()) || null;
@@ -1667,5 +1724,5 @@ async function boot() {
   if (wantRec && ui.hasVault) { ui.pendingRec = true; V.log('rec-link', 'locked, recording starts after unlock'); }
   go(ui.hasVault ? 'lock' : 'setup', {}, 'replace');
 }
-if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake };
+if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake, updater, renderUpdateBar, VERSION };
 boot();

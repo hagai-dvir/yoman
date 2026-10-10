@@ -80,7 +80,9 @@ export function tidy(segments) {
     let cur = [];
     let curPara = longPause;
     for (let i = 0; i < tokens.length; i++) {
-      const m = markerAt(tokens, i);
+      let m = markerAt(tokens, i);
+      // a marker that ends the segment ("...בעשר בבוקר") closes the sentence; it does not open a new one
+      if (m && i + m.split(' ').length >= tokens.length) m = null;
       if (m && cur.length >= 4) {
         sentences.push({ text: finishSentence(cur), para: curPara });
         cur = [];
