@@ -19,7 +19,7 @@ export const uid = () => Date.now().toString(36) + '-' + C.toB64(C.rand(9)).repl
 
 // ---------- settings & diagnostics (plain, no content) ----------
 const DEFAULT_SETTINGS = { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, speechFallback: null,
-  carMode: false, endPhrase: 'סיום הקלטה', silenceStopSec: 0, spokenCues: true, micDeviceId: '', ttsRate: 1 };
+  carMode: false, endPhrase: 'סיום הקלטה', silenceStopSec: 0, spokenCues: true, micDeviceId: '', ttsRate: 1, keepAwake: 'open' };
 export async function getSettings() {
   const s = await db.get('meta', 'settings');
   return { ...DEFAULT_SETTINGS, ...(s || {}) };
@@ -128,33 +128,105 @@ export async function inboxCount() {
   return (await db.getAll('inbox')).length;
 }
 
-// payload: { createdAt, durationSec, segments, restarts, via, audioMime? }  audioBlob optional.
-export async function addToInbox(payload, audioBlob) {
+// payload: { createdAt, durationSec, segments, restarts, via, audioMime? }
+// audio: one Blob, or an array of Blobs (a recording that was cut into parts by going to the background).
+export async function addToInbox(payload, audio) {
   const pub = await db.get('meta', 'inbox-pub');
   if (!pub) throw Object.assign(new Error('no-inbox-key'), { code: 'no-inbox-key' });
   const id = uid();
   const parts = [C.utf8.enc(JSON.stringify(payload))];
-  if (audioBlob) parts.push(new Uint8Array(await audioBlob.arrayBuffer()));
+  for (const b of [].concat(audio || [])) parts.push(new Uint8Array(await b.arrayBuffer()));
   const box = await C.seal(pub.jwk, parts, 'inbox:' + id);
   await db.put('inbox', { id, createdAt: payload.createdAt, box });
   return id;
 }
 
-// After unlock: open every inbox item, hand it to makeEntry(payload, audio), then delete it.
+async function inboxPrivate() {
+  const sec = await C.decryptJSON(vault.key, (await db.get('meta', 'inbox-sec')).enc, 'meta:inbox-sec');
+  return C.fromB64(sec.privateB64);
+}
+
+// After unlock: open every inbox item, hand it to makeEntry(payload, firstAudio, allAudio), then delete it.
 export async function drainInbox(makeEntry) {
   const items = await db.getAll('inbox');
   if (!items.length) return 0;
-  const sec = await C.decryptJSON(vault.key, (await db.get('meta', 'inbox-sec')).enc, 'meta:inbox-sec');
-  const priv = C.fromB64(sec.privateB64);
+  const priv = await inboxPrivate();
   let n = 0;
   for (const it of items) {
     try {
-      const [json, audio] = await C.unseal(priv, it.box, 'inbox:' + it.id);
-      await makeEntry(JSON.parse(C.utf8.dec(json)), audio || null);
+      const [json, ...audios] = await C.unseal(priv, it.box, 'inbox:' + it.id);
+      await makeEntry(JSON.parse(C.utf8.dec(json)), audios[0] || null, audios);
       await db.del('inbox', it.id);
       n++;
     } catch (e) {
       await log('inbox-open-failed', e.name || e.message); // kept for a later attempt, never silently dropped
+    }
+  }
+  return n;
+}
+
+// ---------- recording journal (crash-safe recording in progress) ----------
+// While a recording runs, every audio chunk (≈5 s) and the latest transcript are sealed to the inbox
+// public key and written here. Sealing needs no unlocked key, so this also works for quick capture and
+// if the diary locks mid-recording. A normal stop deletes the journal; if the app was closed or killed
+// first, the next unlock rebuilds the recording from it.
+// Record ids: "<recId>|h" (head), "<recId>|t" (latest text, overwritten), "<recId>|a|<part>|<seq>" (audio).
+const pad = (n) => String(n).padStart(6, '0');
+async function journalSeal(id, obj, bytes) {
+  const pub = await db.get('meta', 'inbox-pub');
+  if (!pub) throw Object.assign(new Error('no-inbox-key'), { code: 'no-inbox-key' });
+  const parts = [C.utf8.enc(JSON.stringify(obj))];
+  if (bytes) parts.push(bytes);
+  return C.seal(pub.jwk, parts, 'journal:' + id);
+}
+export async function journalHead(recId, head) {
+  const id = recId + '|h';
+  await db.put('journal', { id, recId, createdAt: head.createdAt || Date.now(), box: await journalSeal(id, head) });
+}
+export async function journalText(recId, snap) {
+  const id = recId + '|t';
+  await db.put('journal', { id, recId, savedAt: Date.now(), box: await journalSeal(id, snap) });
+}
+export async function journalChunk(recId, part, seq, blob) {
+  const id = `${recId}|a|${pad(part)}|${pad(seq)}`;
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  await db.put('journal', { id, recId, box: await journalSeal(id, { part, seq, type: blob.type || '' }, bytes) });
+}
+export async function journalDrop(recId) {
+  const ids = (await db.keys('journal')).filter((k) => String(k).startsWith(recId + '|'));
+  if (ids.length) await db.delMany('journal', ids);
+  return ids.length;
+}
+export async function journalIds() {
+  return [...new Set((await db.keys('journal')).map((k) => String(k).split('|')[0]))];
+}
+// After unlock: rebuild each unfinished recording and hand it to makeEntry(head, text, audioParts[]),
+// where audioParts = [{ mime, blob }]. skip: the id of a recording still running in this page.
+export async function journalRecover(makeEntry, skip = null) {
+  const skipSet = new Set([].concat(skip || []));
+  const recIds = (await journalIds()).filter((r) => !skipSet.has(r));
+  if (!recIds.length) return 0;
+  const priv = await inboxPrivate();
+  const allKeys = (await db.keys('journal')).map(String).sort();
+  let n = 0;
+  for (const recId of recIds) {
+    try {
+      const mine = allKeys.filter((k) => k.startsWith(recId + '|'));
+      const open = async (id) => { const r = await db.get('journal', id); if (!r) return null; const [j, b] = await C.unseal(priv, r.box, 'journal:' + id); return { meta: JSON.parse(C.utf8.dec(j)), bytes: b || null }; };
+      const head = (await open(recId + '|h'))?.meta || {};
+      const text = (await open(recId + '|t'))?.meta || null;
+      const parts = new Map();
+      for (const k of mine.filter((x) => x.includes('|a|'))) { // sorted: part, then seq
+        const c = await open(k);
+        if (!c || !c.bytes) continue;
+        if (!parts.has(c.meta.part)) parts.set(c.meta.part, { mime: c.meta.type || (head.mimes && head.mimes[c.meta.part]) || head.mime || '', chunks: [] });
+        parts.get(c.meta.part).chunks.push(c.bytes);
+      }
+      const audioParts = [...parts.entries()].sort((a, b) => a[0] - b[0]).map(([, p]) => ({ mime: p.mime, blob: new Blob(p.chunks, { type: p.mime || 'audio/mp4' }) }));
+      if ((text && text.segments && text.segments.length) || audioParts.length) { await makeEntry(head, text, audioParts); n++; }
+      await db.delMany('journal', mine);
+    } catch (e) {
+      await log('journal-recover-failed', e.name || e.message); // kept for a later attempt
     }
   }
   return n;
@@ -172,7 +244,7 @@ async function putEnc(store, obj) {
   await db.put(store, { id: obj.id, enc: await C.encryptJSON(vault.key, obj, store + ':' + obj.id) });
 }
 
-export async function saveEntry(e) { vault.entries.set(e.id, e); await putEnc('entries', e); }
+export async function saveEntry(e) { e.updatedAt = Date.now(); vault.entries.set(e.id, e); await putEnc('entries', e); }
 export async function saveSummary(s) { vault.summaries.set(s.id, s); await putEnc('summaries', s); }
 export async function deleteSummary(id) { vault.summaries.delete(id); await db.del('summaries', id); }
 
@@ -183,6 +255,7 @@ export async function deleteEntry(id) {
   for (const p of vault.photos.values()) if (p.entryId === id) pids.add(p.id);
   for (const pid of pids) await deletePhoto(pid);
   if (e.audioId) await deleteAudio(e.audioId);
+  for (const m of e.audioMore || []) await deleteAudio(m.id);
   vault.entries.delete(id);
   await db.del('entries', id);
 }

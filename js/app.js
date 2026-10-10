@@ -10,8 +10,12 @@ import { buildKoru } from './koru.js';
 import { TEST_DB } from './db.js';
 import * as P from './platform.js';
 import * as VO from './voice.js';
+import { WakeKeeper } from './wake.js';
+import { digestDay, browserSummarizer } from './digest.js';
 
-const VERSION = '1.4.0';
+const VERSION = '1.6.0';
+const JOURNAL_TEXT_MS = 8000;   // how often the transcript of a running recording is written to the crash-safe journal
+const wake = new WakeKeeper({ log: (ev, d) => V.log(ev, d) });
 const WORD_PAGE = 1500;        // word buttons rendered at once in the raw view (100K-character entries stay fast)
 const SHARE_TEXT_MAX = 15000;   // longer texts are shared as a .txt file: share targets cut long text
 const QUICK_URL = new URL('./?rec=1', location.href.split(/[?#]/)[0]).href;
@@ -33,7 +37,7 @@ const ui = {
   entryId: null, entryTab: 'raw', libTab: 'raw', sumKind: 'day', sumKey: null,
   word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewPhoto: null,
   undo: new Map(), rec: null, dict: null, external: false, hasPrf: false, prfMeta: null, bioPending: null,
-  sd: null, photoTarget: null, restoreMode: false, settings: { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, carMode: false, quickCapture: false },
+  sd: null, photoTarget: null, restoreMode: false, settings: { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, carMode: false, quickCapture: false, keepAwake: 'open' },
   quick: false, mics: null, reader: null,
 };
 const refreshSettings = async () => { ui.settings = await V.getSettings(); return ui.settings; };
@@ -79,6 +83,16 @@ function render() {
   if (wt) { updateWriteCount(); if (!ui.writeFocused) { ui.writeFocused = true; wt.focus(); } }
   const wi = $('#word-input');
   if (wi) { wi.focus(); if (ui.word && ui.word.mode !== 'add') wi.select(); }
+  updateWake();
+}
+
+// Screen stays on: while recording/dictating (unless turned off), and by default whenever the diary is
+// open and unlocked. Never on the lock screen, so a forgotten phone still goes dark after the diary locks.
+function updateWake() {
+  const mode = ui.settings.keepAwake || 'open';
+  const busy = !!(ui.rec || ui.dict);
+  const open = V.isUnlocked() && !['lock', 'setup', 'boot'].includes(ui.screen);
+  wake.want(mode !== 'off' && (busy || (mode === 'open' && open)), ui.screen);
 }
 
 async function hydrate() {
@@ -118,10 +132,26 @@ const periodLabel = (kind, key) => kind === 'day' ? S.longDate(key) : kind === '
 
 function summaryText(kind, key) {
   const st = vault.summaries.get(S.summaryId(kind, key));
-  if (st && st.edited) return st.text;
+  if (st && (st.edited || st.digest)) return st.text;
   if (kind === 'day') return S.buildDaily(entriesOfDays([key]));
   if (kind === 'week') return S.buildWeekly(key, (k) => summaryText('day', k));
   return S.buildMonthly(key, (k) => summaryText('day', k));
+}
+
+// "תמצת את היום": local extractive digest of every recording and writing of the day.
+// Uses the tidy text (fillers and repeats already removed); a tidy version the owner edited is his own words too.
+function digestFor(key) {
+  const es = entriesOfDays([key]);
+  const items = es.map((e) => ({ id: e.id, createdAt: e.createdAt, input: e.input, paragraphs: (e.tidy && e.tidy.edited ? e.tidy : tidyFor(e)).paragraphs }));
+  return digestDay(items);
+}
+async function saveDigest(key, d) {
+  await V.saveSummary({ id: S.summaryId('day', key), kind: 'day', key, text: d.text, edited: false, digest: true, digestAt: Date.now(), digestStats: d.stats });
+  V.log('digest', `sentences=${d.stats.sentences} chosen=${d.stats.chosen} words=${d.stats.srcWords}->${d.stats.outWords}`);
+}
+function showDaySummary(key) {
+  if (ui.screen === 'summaries') { Object.assign(ui, TRANSIENT, { sumKind: 'day', sumKey: key }); render(); }
+  else go('summaries', { sumKind: 'day', sumKey: key });
 }
 
 function pushUndo(e) {
@@ -257,6 +287,9 @@ const SCREENS = {
     const es = entriesOfDays([k]);
     const ps = photosOfDays([k]);
     const sum = summaryText('day', k);
+    const stD = vault.summaries.get(S.summaryId('day', k));
+    const isDigest = !!(stD && stD.digest);
+    const digestLabel = isDigest && !stD.edited ? 'תמצת מחדש' : 'תמצת את היום';
     return `<main class="scr with-nav home">${wave('tr')}
     <header class="home-head"><p class="eyebrow">חגי דביר · ${S.longDate(k)}</p></header>
     <section class="home-main">
@@ -264,6 +297,7 @@ const SCREENS = {
       <p class="home-label">הקלט</p>
       <p class="note">נגיעה אחת מתחילה להקליט, והמילים נכתבות לבד.</p>
       <button class="btn ghost write-btn" data-act="write-new">${icon('pencil')}${ui.draft && ui.draft.text ? 'המשך את הטיוטה' : 'כתוב'}</button>
+      ${es.length ? `<button class="btn honey digest-btn" data-act="digest-day" data-key="${k}">${icon('sparkle')}${digestLabel}</button>` : ''}
     </section>
     ${installBar()}
     ${backupNudge()}
@@ -275,13 +309,13 @@ const SCREENS = {
       ${ps.length ? `<div class="photos">${photosHtml(ps, false)}</div>` : '<p class="muted">אין עדיין תמונות.</p>'}
       ${photoButtons(k)}</section>
     <section class="card"><h2>סיכום היום</h2>
-      ${sum ? `<p class="sumtext">${esc(S.firstSentences(sum.replace(/\n/g, ' '), 3))}</p>` : '<p class="muted">הסיכום ייבנה מההקלטות של היום.</p>'}
+      ${sum ? `<p class="sumtext${isDigest ? ' digest' : ''}">${esc(isDigest ? sum : S.firstSentences(sum.replace(/\n/g, ' '), 3))}</p>` : '<p class="muted">הסיכום ייבנה מההקלטות של היום.</p>'}
       <button class="link" data-act="open-sum" data-kind="day" data-key="${k}">לסיכום המלא ←</button></section>
     </main>${nav()}`;
   },
   record() {
     const car = ui.settings.carMode;
-    const phrase = car && ui.settings.endPhrase ? ui.settings.endPhrase : '';
+    const phrase = ui.settings.endPhrase || '';
     const silence = car && ui.settings.silenceStopSec ? ui.settings.silenceStopSec : 0;
     const handsFree = [phrase ? `אמור "${esc(phrase)}" כדי לסיים` : '', silence ? `ההקלטה תיעצר אחרי ${silence} שניות שקט` : ''].filter(Boolean).join(' · ');
     return `<main class="scr rec-scr${car ? ' car' : ''}">${wave('bl')}
@@ -290,7 +324,9 @@ const SCREENS = {
     <p class="rec-mic" id="rec-mic">מיקרופון: ${P.isIOS ? 'לפי בחירת האייפון (דיבורית או אוזניות, אם מחוברות)' : 'ברירת המחדל של הטלפון'}</p>
     <div class="lined rec-text" id="rec-text"><span class="muted">מדברים, והמילים יופיעו כאן.</span></div>
     <p class="note" id="rec-audio"></p>
+    <p class="notice" id="rec-bg" hidden></p>
     ${handsFree ? `<p class="handsfree">${handsFree}</p>` : ''}
+    <p class="note bg-hint">${bgHint()}</p>
     <button class="btn honey wide" id="rec-resume" data-act="rec-resume" hidden>הזיהוי נעצר. הקש כאן כדי להמשיך</button>
     <div class="stopzone"><button class="stop${car ? ' huge' : ''}" data-act="stop-rec" aria-label="עצור"><i></i></button><span class="stop-l">עצור</span></div>
   </main>`;
@@ -383,11 +419,20 @@ const SCREENS = {
       audio = `<audio controls preload="none" data-audio="${a.id}" data-mime="${esc(e.audioMime || '')}"></audio>
         <label class="switch"><span>שמור את הקול לתמיד${a.keep ? '' : `<br><span class="note">אחרת יימחק ב-${S.short(S.dayKey(V.audioExpiry(a)))}</span>`}</span><input type="checkbox" data-change="audio-keep" data-id="${a.id}" ${a.keep ? 'checked' : ''}></label>`;
     } else if (e.audioId) audio = '<p class="muted">הקול של ההקלטה נמחק אחרי 30 יום. הטקסט נשאר.</p>';
+    const more = (e.audioMore || []).map((m) => vault.audio.get(m.id) ? { ...m, a: vault.audio.get(m.id) } : null).filter(Boolean);
+    if (more.length) {
+      audio += `<p class="note">ההקלטה נשמרה בכמה חלקים, כי המיקרופון נעצר כשהיומן היה ברקע.</p>`
+        + more.map((m, i) => `<p class="note">חלק ${i + 2}</p><audio controls preload="none" data-audio="${m.id}" data-mime="${esc(m.mime || '')}"></audio>`).join('');
+    }
+    if (e.bgGaps && e.bgGaps.length) {
+      audio += `<p class="notice">היומן היה ברקע ${e.bgGaps.map((g) => `${mmss(g.from)}–${mmss(g.to)}`).join(', ')}. בזמן הזה המילים לא נכתבו.${e.audioId ? ' מה שנאמר נשמר בקול, אם האייפון השאיר את המיקרופון פתוח. אפשר להאזין ולהוסיף בכתיבה.' : ''}</p>`;
+    }
+    if (e.recovered) audio += '<p class="note">ההקלטה הזו נקטעה כשהיומן נסגר, ושוחזרה מהשמירה השוטפת. ייתכן שהשניות האחרונות חסרות.</p>';
     if (e.audioNote) audio += `<p class="note">${esc(conflictText(e.audioNote))}</p>`;
     const photos = (e.photoIds || []).map((id) => vault.photos.get(id)).filter(Boolean);
     return `<main class="scr with-nav">${wave('tr')}
       <header class="head"><button class="icon-btn" data-act="back" aria-label="חזרה">${icon('back')}</button>
-        <p class="eyebrow" style="flex:1">${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${entryDur(e)}${e.via === 'quick' ? ' · הקלטה מהירה' : ''}</p></header>
+        <p class="eyebrow" style="flex:1">${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${entryDur(e)}${e.via === 'quick' ? ' · הקלטה מהירה' : ''}${e.recovered ? ' · שוחזרה' : ''}</p></header>
       <div><div class="tabs"><button data-act="entry-tab" data-tab="raw" class="${on(ui.entryTab === 'raw')}">מה שאמרתי</button><button data-act="entry-tab" data-tab="tidy" class="${on(ui.entryTab === 'tidy')}">מסודר לפרסום</button></div>
       <div class="folder">${confirmBox('regen', 'הגרסה המסודרת נערכה ידנית. סידור מחדש ידרוס את העריכה (אפשר לבטל אחר כך).', 'regen-yes', 'סדר מחדש')}${body}</div></div>
       ${audio ? `<section class="card audio-box"><h2>הקול</h2>${audio}</section>` : ''}
@@ -434,19 +479,32 @@ const SCREENS = {
     const source = kind === 'day' ? `נבנה מ-${es.length} הקלטות` : `נבנה מ-${withDaily} סיכומים יומיים`;
     const dots = kind === 'week' ? `<div class="days" aria-label="ימים עם הקלטה">${days.map((k, i) => `<span><i class="${entriesOfDays([k]).length ? 'y' : ''}"></i>${S.DAY_LETTERS[i]}</span>`).join('')}</div>` : '';
     const photos = photosOfDays(days);
+    const digest = !!(st && st.digest);
+    const digestStale = digest && !edited && (es.some((e) => e.createdAt > st.digestAt || (e.updatedAt || 0) > st.digestAt) || (st.digestStats && st.digestStats.entries !== es.length));
+    const note = edited ? (digest ? 'תקציר שערכת ידנית.' : 'נערך ידנית.')
+      : digest ? `תקציר שנוצר בטלפון מ-${es.length} הקלטות וכתיבות. כל משפט לקוח מדבריך, בלי תוספות.`
+      : source + '. מתעדכן לבד.';
+    const digestBtn = kind === 'day' && es.length && !ui.sumEdit
+      ? `<button class="btn honey wide digest-btn${digestStale ? ' hot' : ''}" data-act="digest-day" data-key="${key}">${icon('sparkle')}${digest && !edited ? 'תמצת מחדש' : 'תמצת את היום'}</button>` : '';
+    const digestConfirm = ui.confirm === 'digest-replace' && ui.digestPending && ui.digestPending.key === key
+      ? `<div class="confirm" role="alert"><p>כבר יש סיכום יומי שערכת. להחליף אותו בתקציר הזה? העריכה שלך תימחק.</p>
+          <p class="sumtext digest preview">${esc(ui.digestPending.text)}</p>
+          <div class="row"><button class="btn danger" data-act="digest-replace-yes">החלף בתקציר</button><button class="btn ghost" data-act="confirm-cancel">השאר את שלי</button></div></div>` : '';
     const body = ui.sumEdit
       ? `<form data-form="sum-edit" style="display:flex;flex-direction:column;gap:10px"><textarea class="input typedta grow" id="sum-ta">${esc(text)}</textarea>
           <div class="row"><button class="btn" type="submit">שמור</button><button type="button" class="btn ghost" data-act="sum-cancel">ביטול</button>${FS_BTN}</div></form>`
-      : `${text ? `<p class="sumtext">${esc(text)}</p>` : '<p class="muted">אין עדיין הקלטות בתקופה הזו.</p>'}
-         <p class="note">${edited ? 'נערך ידנית.' : source + '. מתעדכן לבד.'}</p>
-         ${newer ? '<p class="notice">נוספו הקלטות אחרי העריכה. "בנה מחדש" יכלול אותן וידרוס את העריכה.</p>' : ''}
-         <div class="row"><button class="chip" data-act="sum-edit">${icon('pencil')}ערוך</button>${edited ? `<button class="chip ${newer ? 'hot' : ''}" data-act="sum-rebuild">${icon('sparkle')}בנה מחדש</button>` : ''}</div>
+      : `${digestConfirm}${text ? `<p class="sumtext${digest ? ' digest' : ''}">${esc(text)}</p>` : '<p class="muted">אין עדיין הקלטות בתקופה הזו.</p>'}
+         <p class="note">${note}</p>
+         ${newer ? `<p class="notice">נוספו הקלטות אחרי העריכה. ${kind === 'day' ? '"תמצת את היום" או ' : ''}"בנה מחדש" יכלול אותן וידרוס את העריכה.</p>` : ''}
+         ${digestStale ? '<p class="notice">נוספו הקלטות או תיקונים אחרי התמצות. "תמצת מחדש" יכלול אותם.</p>' : ''}
+         <div class="row"><button class="chip" data-act="sum-edit">${icon('pencil')}ערוך</button>${edited ? `<button class="chip ${newer ? 'hot' : ''}" data-act="sum-rebuild">${icon('sparkle')}בנה מחדש</button>` : ''}${digest && !edited ? `<button class="chip" data-act="sum-rebuild-yes">לסיכום הרגיל</button>` : ''}</div>
          ${confirmBox('sum-rebuild', 'לבנות מחדש מהסיכומים היומיים? העריכה הידנית תימחק.', 'sum-rebuild-yes', 'בנה מחדש')}`;
     return `<main class="scr with-nav">${wave('tr')}
       <header class="head"><h1>סיכומים</h1></header>
       <div class="seg"><button data-act="sum-kind" data-kind="day" class="${on(kind === 'day')}">יומי</button><button data-act="sum-kind" data-kind="week" class="${on(kind === 'week')}">שבועי</button><button data-act="sum-kind" data-kind="month" class="${on(kind === 'month')}">חודשי</button></div>
       <div class="period"><button class="icon-btn" data-act="sum-nav" data-dir="-1" aria-label="התקופה הקודמת">${icon('back')}</button><h2>${periodLabel(kind, key)}</h2>
         <button class="icon-btn" data-act="sum-nav" data-dir="1" aria-label="התקופה הבאה" ${canNext ? '' : 'disabled style="opacity:.3"'}>${icon('next')}</button></div>
+      ${digestBtn}
       <section class="card">${dots}${body}</section>
       ${photos.length ? `<section class="card"><h2>תמונות</h2><div class="photos">${photosHtml(photos, false)}</div></section>` : ''}
       <div class="row"><button class="btn honey" style="flex:1" data-act="share-sum" ${text ? '' : 'disabled'}>${icon('share')}שלח</button>
@@ -471,8 +529,13 @@ const SCREENS = {
       <details class="card" open><summary>כניסה ונעילה</summary>
         ${bio}
         <label class="field">נעילה אוטומטית אחרי חוסר פעילות<select id="autolock" data-change="autolock">${[1, 3, 5, 10].map((m) => `<option value="${m}" ${d.settings.autolockMin === m ? 'selected' : ''}>${m} דקות</option>`).join('')}</select></label>
-        <p class="note">היומן ננעל גם מיד כשעוברים לאפליקציה אחרת או מכבים את המסך.</p>
+        <p class="note">היומן ננעל גם מיד כשעוברים לאפליקציה אחרת או מכבים את המסך. בזמן הקלטה הוא לא ננעל, גם לא ברקע, כדי שההקלטה תימשך. אם ההקלטה עברה ברקע, היומן ננעל מיד כשהיא נשמרת.</p>
         <button class="btn ghost" data-act="lock-now">${icon('lock')}נעל עכשיו</button>
+      </details>
+      <details class="card"><summary>מסך דולק</summary>
+        <label class="field">מתי למנוע מהמסך להחשיך<select id="keep-awake" data-change="keep-awake">${[['open', 'כל עוד היומן פתוח (מומלץ)'], ['rec', 'רק בזמן הקלטה או הכתבה'], ['off', 'אף פעם (לפי הגדרות האייפון)']].map(([v, l]) => `<option value="${v}" ${(d.settings.keepAwake || 'open') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+        <p class="note">כשהיומן ננעל (אחרי ${d.settings.autolockMin} דקות בלי נגיעה, או כשעוברים לאפליקציה אחרת), המסך חוזר להתנהג כרגיל, כדי שטלפון שנשכח על השולחן לא יישאר דולק. בזמן הקלטה היומן לא ננעל.</p>
+        <p class="note">מצב כרגע: <b>${esc(wakeLabel())}</b></p>
       </details>
       <details class="card"><summary>החלפת סיסמה</summary>
         <form data-form="change-pw" style="display:flex;flex-direction:column;gap:10px" novalidate>
@@ -486,7 +549,7 @@ const SCREENS = {
         <label class="field">מילת סיום (נמחקת מהטקסט). השאר ריק כדי לכבות<input id="end-phrase" data-change="end-phrase" value="${esc(d.settings.endPhrase || '')}" autocomplete="off"></label>
         <label class="field">עצירה אוטומטית אחרי שקט<select id="silence-stop" data-change="silence-stop">${[[0, 'כבוי'], [20, '20 שניות'], [30, '30 שניות'], [60, 'דקה'], [120, '2 דקות']].map(([v, l]) => `<option value="${v}" ${d.settings.silenceStopSec === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
         <label class="switch"><span>לומר "נשמר" בסוף (בנוסף לצליל)</span><input type="checkbox" data-change="spoken-cues" ${d.settings.spokenCues ? 'checked' : ''}></label>
-        <p class="note">מילת הסיום והעצירה אחרי שקט פועלות רק במצב נהיגה. בלי מצב נהיגה ההקלטה נעצרת רק כשלוחצים "עצור".</p>
+        <p class="note">מילת הסיום פועלת בכל הקלטה, אבל רק כשהיומן מוצג על המסך (ברקע המילים לא מתומללות, ולכן גם היא לא נשמעת). העצירה אחרי שקט פועלת רק במצב נהיגה.</p>
         ${P.isIOS
           ? '<p class="note">באייפון הדפדפן לא יכול לבחור מיקרופון. כשדיבורית הרכב או אוזניות בלוטות\' מחוברות, האייפון בדרך כלל משתמש במיקרופון שלהן. במסך ההקלטה כתוב איזה מיקרופון פעיל, כשאפשר לדעת.</p>'
           : `<label class="field">מיקרופון<select id="mic" data-change="mic"><option value="">ברירת המחדל של הטלפון</option>${(ui.mics || []).map((m) => `<option value="${esc(m.deviceId)}" ${d.settings.micDeviceId === m.deviceId ? 'selected' : ''}>${esc(m.label || 'מיקרופון')}</option>`).join('')}</select></label>
@@ -540,6 +603,7 @@ const SCREENS = {
       <details class="card"><summary>מה יוצא מהטלפון</summary>
         <ul style="margin:0;padding-inline-start:20px;display:flex;flex-direction:column;gap:6px">
           <li>בזמן הקלטה: הקול עובר לגוגל לצורך התמלול, דרך Chrome.</li>
+          <li>"תמצת את היום": נעשה כולו בטלפון. שום טקסט לא נשלח.</li>
           <li>כשאתה לוחץ "שלח": הטקסט והתמונות עוברים לאפליקציה שבחרת.</li>
           <li>כשאתה לוחץ על קישור מפה: גוגל מפות נפתח עם הנקודה.</li>
           <li>שום דבר אחר. האתר חסום מלשלוח נתונים לכל כתובת.</li></ul>
@@ -552,7 +616,11 @@ const SCREENS = {
           ${d.prf ? `<dt>רישום PRF</dt><dd>${esc(d.prf.path)} (enabled=${esc(String(d.prf.enabledFlag))})</dd>` : ''}
           <dt>מותקן כאפליקציה</dt><dd>${P.isStandalone() ? 'כן' : 'לא'}</dd>
           <dt>מערכת</dt><dd>${P.isIOS ? 'iOS' : P.isAndroid ? 'Android' : 'אחר'} · תמלול דרך ${P.speechVendor}</dd>
-          <dt>הקלטת קול</dt><dd>${window.MediaRecorder ? (P.audioMimeCandidates().find((m) => MediaRecorder.isTypeSupported(m)) || 'אין פורמט נתמך') : 'לא נתמכת'}</dd></dl>
+          <dt>הקלטת קול</dt><dd>${window.MediaRecorder ? (P.audioMimeCandidates().find((m) => MediaRecorder.isTypeSupported(m)) || 'אין פורמט נתמך') : 'לא נתמכת'}</dd>
+          <dt>מסך דולק</dt><dd dir="ltr">wakelock: ${esc(wake.describe())}</dd>
+          <dt>הקלטה ברקע</dt><dd dir="ltr">bg-rec: ${esc(lastBgLine(d.log))}</dd>
+          <dt>audioSession</dt><dd dir="ltr">${navigator.audioSession ? 'yes' : 'no'}</dd>
+          <dt>תמצות</dt><dd dir="ltr">local-extractive · browser: ${esc(browserSummarizer())}</dd></dl>
         <p class="note">היומן הטכני לא כולל שום טקסט שלך.</p>
         <pre class="logl">${esc(logTxt) || '—'}</pre>
         <button class="chip" data-act="copy-log">${icon('copy')}העתק אבחון</button>
@@ -572,6 +640,15 @@ function wordPop(e) {
     <input class="input" id="word-input" value="${mode === 'add' ? '' : esc(word)}" placeholder="${mode === 'add' ? 'מה להוסיף' : ''}" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="done">
     <div class="acts">${acts}</div></div>`;
 }
+
+function wakeLabel() {
+  const s = wake.state;
+  if (s === 'on') return 'המסך נשאר דולק עכשיו';
+  if (s === 'unsupported') return 'הדפדפן הזה לא תומך בשמירת מסך דולק. אפשר להאריך את "נעילה אוטומטית" בהגדרות האייפון';
+  if (s.startsWith('failed')) return 'האייפון סירב לשמור את המסך דולק (' + s.slice(7) + '). אם מצב חיסכון בסוללה פעיל, זו כנראה הסיבה';
+  return 'כבוי';
+}
+const lastBgLine = (log) => { const l = (log || []).filter((x) => x.ev === 'rec-saved' || x.ev === 'rec-saved-quick').reverse().find((x) => /\bbg=/.test(x.detail)); return l ? l.detail.slice(l.detail.indexOf('bg=')) : 'עוד לא הייתה הקלטה שעברה ברקע'; };
 
 async function loadSettingsData() {
   ui.sd = { settings: await V.getSettings(), prf: await V.prfInfo(), storage: await V.storageInfo(), caps: await W.capabilities(), log: await V.getLog() };
@@ -625,12 +702,15 @@ async function startRecording(pathReason = 'default', opts = {}) {
   const settings = ui.settings;
   const car = !!settings.carMode;
   if (car && !opts.auto) VO.primeAudio();
+  const journalId = V.uid();
   const r = new Recorder({
     withAudio: settings.recordAudio,
-    endPhrase: car ? (settings.endPhrase || '') : '',
+    // The end phrase works in every recording (it is unlikely to be said by accident); silence-stop only in car mode.
+    endPhrase: settings.endPhrase || '',
     silenceStopMs: car ? (settings.silenceStopSec || 0) * 1000 : 0,
     deviceId: P.isIOS ? '' : (settings.micDeviceId || ''),
     log: (ev, d) => V.log(ev, d),
+    onChunk: (part, seq, blob) => journalWrite(() => V.journalChunk(journalId, part, seq, blob)),
     onUpdate: ({ finalText, interim }) => {
       const el = $('#rec-text');
       if (!el) return;
@@ -648,6 +728,7 @@ async function startRecording(pathReason = 'default', opts = {}) {
       if (s.kind === 'unavailable') switchToDictation(s.reason);
       if (s.kind === 'end-phrase' || s.kind === 'silence-stop') finishRecording(s.kind);
       if (s.kind === 'mic') { const m = $('#rec-mic'); if (m) m.textContent = 'מיקרופון: ' + (s.label || 'לא ידוע'); }
+      if (s.kind === 'back') backFromBackground(s);
       if (s.kind === 'audio' && au) {
         if (s.state === 'recording') au.textContent = 'גם הקול נשמר, מוצפן, ל-30 יום.';
         if (s.state === 'conflict') { au.textContent = conflictText(s.reason); toast('התמלול והקלטת הקול התנגשו. התמלול ממשיך, הקול לא נשמר.', 6000); }
@@ -655,12 +736,17 @@ async function startRecording(pathReason = 'default', opts = {}) {
       }
     },
   });
-  ui.rec = { r, t0: Date.now(), quick: !!opts.quick, auto: !!opts.auto, car };
+  ui.rec = { r, t0: Date.now(), quick: !!opts.quick, auto: !!opts.auto, car, journalId, wentBg: false };
   if (opts.quick) ui.quick = true;
   go('record');
   try {
     await r.start();
-    V.log('rec-path', `live reason=${pathReason} ios=${P.isIOS} standalone=${P.isStandalone()} audio=${settings.recordAudio} car=${car} quick=${!!opts.quick} auto=${!!opts.auto}`);
+    V.log('rec-path', `live reason=${pathReason} ios=${P.isIOS} standalone=${P.isStandalone()} audio=${settings.recordAudio} car=${car} quick=${!!opts.quick} auto=${!!opts.auto} wake=${wake.state}`);
+    const recObj = ui.rec;
+    if (recObj && recObj.r === r) {
+      journalWrite(() => V.journalHead(journalId, { createdAt: recObj.t0, quick: !!opts.quick }));
+      recObj.textTimer = setInterval(() => journalSnapshot(recObj), JOURNAL_TEXT_MS);
+    }
     if (!opts.auto) {
       // Live recognition worked after an earlier failure (e.g. iOS fixed it): forget the learned fallback.
       setTimeout(async () => { if (r.everStarted && ui.settings.speechFallback) { await V.setSettings({ speechFallback: null }); await refreshSettings(); V.log('rec-path', 'live works again, fallback cleared'); } }, 5000);
@@ -676,8 +762,55 @@ async function startRecording(pathReason = 'default', opts = {}) {
     go(ui.quick ? 'lock' : 'today', {}, 'replace');
     return;
   }
-  ui.rec.timer = setInterval(() => { const el = $('#rec-time'); if (el && ui.rec) el.textContent = mmss(Date.now() - ui.rec.t0); }, 500);
+  if (ui.rec) ui.rec.timer = setInterval(() => { const el = $('#rec-time'); if (el && ui.rec) el.textContent = mmss(Date.now() - ui.rec.t0); }, 500);
 }
+
+// What happens if the owner switches to another app during a recording, said honestly per platform.
+function bgHint() {
+  if (!ui.settings.recordAudio) return 'אפשר לעבור לאפליקציה אחרת וההקלטה לא תיעצר, אבל המילים נכתבות רק כשהיומן מוצג. שמירת הקול כבויה בהגדרות, ולכן מה שנאמר כשהיומן ברקע לא יישמר.';
+  if (P.isIOS && P.isStandalone()) return 'אפשר לעבור לאפליקציה אחרת וההקלטה לא תיעצר. אבל ביומן שמותקן במסך הבית, iOS כנראה עוצר את המיקרופון ברקע, ולכן מה שנאמר שם עלול לא להיקלט. כשתחזור, יופיע כאן מה קרה.';
+  if (P.isIOS) return 'אפשר לעבור לאפליקציה אחרת: הקול אמור להמשיך להישמר גם ברקע, אבל המילים ייכתבו רק כשתחזור ליומן. כשתחזור, יופיע כאן מה קרה.';
+  return 'אפשר לעבור לאפליקציה אחרת: הקול ממשיך להישמר אם הדפדפן מאפשר, והמילים ייכתבו כשתחזור ליומן.';
+}
+
+// ---- crash-safe journal: writes are queued so they land in order, and never break the recording
+let journalQueue = Promise.resolve();
+let journalFailLogged = false;
+function journalWrite(fn) {
+  journalQueue = journalQueue.then(fn).catch((e) => {
+    if (!journalFailLogged) { journalFailLogged = true; V.log('journal-failed', e.code || e.name || e.message); }
+  });
+  return journalQueue;
+}
+function journalSnapshot(rec = ui.rec) {
+  if (!rec || rec.finishing) return;
+  const snap = rec.r.snapshot();
+  const sig = snap.chars + ':' + snap.segments.length + ':' + snap.gaps.length;
+  if (sig === rec.lastSig && !rec.forceSnap) return;
+  rec.lastSig = sig;
+  rec.forceSnap = false;
+  journalWrite(() => V.journalText(rec.journalId, { ...snap, restarts: rec.r.restarts, mic: rec.r.micLabel || '', quick: rec.quick }));
+}
+function endJournal(rec) {
+  clearInterval(rec.textTimer);
+  return journalWrite(() => V.journalDrop(rec.journalId));
+}
+
+// The owner came back to the app during a recording. Say plainly what happened while away.
+function backFromBackground(s) {
+  const rec = ui.rec;
+  if (!rec) return;
+  const el = $('#rec-bg');
+  const audioOn = rec.r.audio.state === 'recording';
+  let msg;
+  if (s.speechResults > 0) msg = `היית מחוץ ליומן ${fmtAway(s.awaySec)}. התמלול המשיך גם ברקע.`;
+  else if (audioOn && s.chunks > 0) msg = `היית מחוץ ליומן ${fmtAway(s.awaySec)}. הקול נשמר גם ברקע, אבל המילים מהזמן הזה לא נכתבו. אפשר להאזין להן בהקלטה ולהקליד.`;
+  else if (audioOn) msg = `היית מחוץ ליומן ${fmtAway(s.awaySec)}. האייפון עצר את המיקרופון ברקע, ולכן מה שנאמר בזמן הזה לא נקלט. מעכשיו ההקלטה ממשיכה.`;
+  else msg = `היית מחוץ ליומן ${fmtAway(s.awaySec)}. מה שנאמר בזמן הזה לא נקלט${ui.settings.recordAudio ? '' : ' (שמירת הקול כבויה בהגדרות)'}. מעכשיו ההקלטה ממשיכה.`;
+  if (el) { el.textContent = msg; el.hidden = false; }
+  toast(msg, 8000);
+}
+const fmtAway = (sec) => (sec < 60 ? `${sec} שניות` : `${Math.round(sec / 60)} דקות`);
 
 // Start whichever input path applies; quick = the diary is locked and the result goes to the inbox.
 function startAny(reason, quick) {
@@ -693,6 +826,7 @@ async function autoStartRefused(r, s) {
   rec.finishing = true;
   clearInterval(rec.timer);
   await r.stop();
+  endJournal(rec);
   ui.rec = null;
   V.log('auto-start-refused', `${s.kind}:${s.error || s.reason || ''} ios=${P.isIOS} standalone=${P.isStandalone()}`);
   go('tapstart', {}, 'replace');
@@ -703,8 +837,17 @@ function entryFromRecording(id, createdAt, res, extra = {}) {
     id, createdAt, dayKey: S.dayKey(createdAt), durationSec: res.durationSec,
     segments: res.segments, rawVersion: 1, tidy: { ...tidy(res.segments), edited: false, fromRawVersion: 1 },
     audioId: null, audioMime: null, audioNote: res.audioConflict || null, photoIds: [], restarts: res.restarts,
-    mic: res.micLabel || '', ...extra,
+    mic: res.micLabel || '', ...(res.gaps && res.gaps.length ? { bgGaps: res.gaps } : {}), ...extra,
   };
+}
+
+// Save every audio part of a recording: the first is the entry's audio, the rest are listed in audioMore.
+async function saveAudioParts(e, parts) {
+  for (const p of parts || []) {
+    if (!p || !p.blob || !p.blob.size) continue;
+    const a = await V.saveAudio(e.id, p.blob, p.mime);
+    if (!e.audioId) { e.audioId = a.id; e.audioMime = a.mime; } else (e.audioMore = e.audioMore || []).push({ id: a.id, mime: a.mime });
+  }
 }
 
 async function finishRecording(reason = 'stop') {
@@ -712,35 +855,51 @@ async function finishRecording(reason = 'stop') {
   if (!rec || rec.finishing) return null;
   rec.finishing = true;
   clearInterval(rec.timer);
+  clearInterval(rec.textTimer);
   const st = $('#rec-status');
   if (st) st.textContent = 'שומר…';
   const res = await rec.r.stop();
   ui.rec = null;
+  lastActivity = Date.now(); // a hands-free stop is activity too: do not lock the moment the entry opens
   const handsFree = reason === 'end-phrase' || reason === 'silence-stop';
   if (!res.segments.length && !res.audioBlob) {
     V.log('rec-empty', reason);
+    endJournal(rec);
     if (rec.car) VO.beep('stop');
     if (reason !== 'hidden') { toast('לא נקלט דיבור, ולכן לא נשמר כלום.'); go(rec.quick ? 'quickDone' : 'today', {}, 'replace'); }
     return null;
   }
-  const logLine = `reason=${reason} segs=${res.segments.length} restarts=${res.restarts} audio=${res.audioState}${res.audioConflict ? ' conflict=' + res.audioConflict : ''} mic=${res.micLabel ? 'named' : 'default'} trackToRecognizer=${res.trackToRecognizer}`;
+  const b = res.bg || {};
+  const logLine = `reason=${reason} segs=${res.segments.length} restarts=${res.restarts} audio=${res.audioState}${res.audioConflict ? ' conflict=' + res.audioConflict : ''} parts=${(res.audioParts || []).length} mic=${res.micLabel ? 'named' : 'default'} trackToRecognizer=${res.trackToRecognizer}`
+    + (b.times ? ` bg=${b.times}x gaps=${(res.gaps || []).length} chunksHidden=${b.chunksWhileHidden} speechHidden=${b.resultsWhileHidden} audioRestarts=${b.audioRestarts}` : '');
   if (rec.quick) {
     // Locked: seal to the inbox public key. Nothing readable is written.
+    const parts = (res.audioParts || []).map((p) => p.blob);
     await V.addToInbox({ createdAt: rec.t0, durationSec: res.durationSec, segments: res.segments, restarts: res.restarts,
-      audioMime: res.audioMime || '', audioConflict: res.audioConflict || null, micLabel: res.micLabel || '', via: 'quick' }, res.audioBlob);
+      audioMime: res.audioMime || '', audioMimes: (res.audioParts || []).map((p) => p.mime), gaps: res.gaps || [],
+      audioConflict: res.audioConflict || null, micLabel: res.micLabel || '', via: 'quick' }, parts);
     V.log('rec-saved-quick', logLine);
   } else {
     const id = V.uid();
     const e = entryFromRecording(id, rec.t0, res);
-    if (res.audioBlob) { const a = await V.saveAudio(id, res.audioBlob, res.audioMime); e.audioId = a.id; e.audioMime = a.mime; }
+    await saveAudioParts(e, res.audioParts);
     await V.saveEntry(e);
     V.log('rec-saved', logLine);
     rec.entryId = id;
   }
+  endJournal(rec); // saved for real: the crash-safe copy is no longer needed
   if (rec.car) { VO.beep('stop'); if (ui.settings.spokenCues) setTimeout(() => VO.sayShort('נשמר'), 450); }
   if (reason === 'hidden') return null;
-  if (rec.quick) go('quickDone', {}, 'replace');
-  else go('entry', { entryId: rec.entryId, entryTab: handsFree ? 'tidy' : 'raw' }, 'replace');
+  if (rec.quick) { go('quickDone', {}, 'replace'); return true; }
+  // The diary stayed open while the recording ran in the background. Lock now, as it would have locked
+  // when the app was left, so no one who picked up the phone meanwhile gets past this point.
+  if (rec.wentBg && V.isUnlocked()) {
+    toast('ההקלטה נשמרה. היומן ננעל כי ההקלטה עברה ברקע. אחרי הפתיחה היא תיפתח.', 7000);
+    ui.afterUnlockEntry = rec.entryId;
+    await doLock('after-background-recording');
+    return true;
+  }
+  go('entry', { entryId: rec.entryId, entryTab: handsFree ? 'tidy' : 'raw' }, 'replace');
   return true;
 }
 // ---------------------------------------------------------------- keyboard dictation (iOS Home Screen app, or by choice)
@@ -760,6 +919,7 @@ async function switchToDictation(failReason = 'unknown') {
   rec.finishing = true;
   clearInterval(rec.timer);
   await rec.r.stop();
+  endJournal(rec);
   ui.rec = null;
   await V.setSettings({ speechFallback: { reason: failReason, ua: navigator.userAgent, at: Date.now() } });
   await refreshSettings();
@@ -1002,7 +1162,10 @@ async function shareLongText(title, full) {
 
 // ---------------------------------------------------------------- lock / unlock
 let lastActivity = Date.now();
-['pointerdown', 'keydown', 'touchstart', 'scroll'].forEach((ev) => addEventListener(ev, () => { lastActivity = Date.now(); }, { passive: true, capture: true }));
+['pointerdown', 'keydown', 'touchstart', 'scroll'].forEach((ev) => addEventListener(ev, () => {
+  lastActivity = Date.now();
+  if (wake.wanted && !wake.held && ev === 'pointerdown') wake.acquire('tap'); // a refused request may succeed inside a tap
+}, { passive: true, capture: true }));
 
 async function doLock(reason) {
   if (!V.isUnlocked()) return;
@@ -1026,17 +1189,45 @@ async function afterUnlock(how) {
   ui.quick = false;
   ui.draft = await V.getDraft().catch(() => null);
   ui.hasInbox = await V.hasInboxKey();
-  const n = await V.drainInbox(async (p, audio) => {
+  const n = await V.drainInbox(async (p, audio, audios) => {
     const id = V.uid();
-    const e = entryFromRecording(id, p.createdAt, { segments: p.segments || [], durationSec: p.durationSec || 0, restarts: p.restarts || 0, audioConflict: p.audioConflict, micLabel: p.micLabel }, { via: p.via || 'quick' });
-    if (audio && audio.length) { const a = await V.saveAudio(id, new Blob([audio], { type: p.audioMime || 'audio/mp4' }), p.audioMime); e.audioId = a.id; e.audioMime = a.mime; }
+    const e = entryFromRecording(id, p.createdAt, { segments: p.segments || [], durationSec: p.durationSec || 0, restarts: p.restarts || 0, audioConflict: p.audioConflict, micLabel: p.micLabel, gaps: p.gaps }, { via: p.via || 'quick' });
+    const mimes = p.audioMimes || [p.audioMime];
+    await saveAudioParts(e, (audios || []).map((bytes, i) => ({ mime: mimes[i] || p.audioMime || 'audio/mp4', blob: new Blob([bytes], { type: mimes[i] || p.audioMime || 'audio/mp4' }) })));
     await V.saveEntry(e);
   });
   if (n) { V.log('inbox-drained', String(n)); toast(n === 1 ? 'הקלטה מהירה אחת נכנסה ליומן.' : `${n} הקלטות מהירות נכנסו ליומן.`); }
+  // Recordings cut off by closing the app (or iOS ending it) are rebuilt from the crash-safe journal.
+  // First let pending journal writes finish: a recording saved a moment ago may still have its
+  // "drop" queued, and must not be mistaken for a cut-off one.
+  await journalQueue;
+  const nr = await V.journalRecover(async (head, text, parts) => {
+    const id = V.uid();
+    const createdAt = head.createdAt || Date.now();
+    const segments = (text && text.segments) || [];
+    const e = entryFromRecording(id, createdAt, { segments, durationSec: (text && text.durationSec) || 0, restarts: (text && text.restarts) || 0, micLabel: text && text.mic, gaps: text && text.gaps }, { via: head.quick ? 'quick' : 'recovered', recovered: true });
+    await saveAudioParts(e, parts);
+    await V.saveEntry(e);
+  }, ui.rec ? ui.rec.journalId : null).catch((err) => { V.log('journal-recover-failed', err.message); return 0; });
+  if (nr) { V.log('journal-recovered', String(nr)); toast(nr === 1 ? 'הקלטה שנקטעה כשהיומן נסגר שוחזרה ונכנסה ליומן.' : `${nr} הקלטות שנקטעו שוחזרו ונכנסו ליומן.`, 7000); }
   if (ui.pendingRec) { ui.pendingRec = false; go('today', {}, 'replace'); startRecording('rec-link-after-unlock', { auto: true }); return; }
+  const after = ui.afterUnlockEntry;
+  ui.afterUnlockEntry = null;
+  if (after && vault.entries.has(after)) { go('today', {}, 'replace'); go('entry', { entryId: after, entryTab: 'raw' }); return; }
   go('today', {}, 'replace');
 }
 
+// The app is being closed or unloaded during a recording: push the newest audio and text to the journal.
+// (iOS may kill the page without this event; then at most the last ~5 s of audio and ~8 s of text are lost.)
+addEventListener('pagehide', () => {
+  if (!ui.rec || ui.rec.finishing) return;
+  V.log('bg-rec', 'pagehide during recording');
+  try { if (ui.rec.r.recorder && ui.rec.r.recorder.state === 'recording') ui.rec.r.recorder.requestData(); } catch (e) { /* ignore */ }
+  ui.rec.forceSnap = true;
+  journalSnapshot(ui.rec);
+});
+
+// Inactivity lock. Never during a recording or dictation (they are activity even without touches).
 setInterval(async () => {
   if (!V.isUnlocked() || ui.rec || ui.dict || ui.external) return;
   const s = ui.settings;
@@ -1047,12 +1238,22 @@ let hiddenAt = 0;
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden) {
     hiddenAt = Date.now();
-    if (ui.rec && ui.rec.quick) { await finishRecording('hidden'); return; }
+    if (ui.rec && !ui.rec.finishing) {
+      // A recording keeps running when the owner switches apps: it ends only on "עצור", the end phrase,
+      // or when the app is closed (then the journal has it). The diary is not locked meanwhile, because
+      // the running recording needs it; it locks as soon as the recording is saved (see finishRecording).
+      ui.rec.wentBg = true;
+      ui.rec.forceSnap = true;
+      journalSnapshot(ui.rec);
+      ui.rec.r.setHidden(true);
+      return;
+    }
     if (ui.dict && ui.dict.quick) { await finishDictation('hidden'); return; } // locked quick capture: seal what was said
     if (!V.isUnlocked() || ui.external) return;
-    if (ui.rec) { await finishRecording('hidden'); }
-    if (ui.dict) { await finishDictation('hidden'); }
+    if (ui.dict) { await finishDictation('hidden'); } // keyboard dictation cannot continue in the background
     doLock('background');
+  } else if (ui.rec && !ui.rec.finishing) {
+    ui.rec.r.setHidden(false);
   } else if (ui.external) {
     if (Date.now() - hiddenAt > 5 * 60000) { ui.external = false; doLock('background-long'); return; }
     setTimeout(() => { ui.external = false; }, 2000); // the picker/share sheet was cancelled
@@ -1242,6 +1443,32 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
   'sum-edit': () => { ui.sumEdit = true; render(); },
   'sum-cancel': () => { ui.sumEdit = false; render(); },
   'sum-rebuild': () => { ui.confirm = 'sum-rebuild'; render(); },
+  // A summary the owner edited is never replaced without his explicit "החלף בתקציר".
+  'digest-day': async (el) => {
+    const key = el.dataset.key || ui.sumKey || today();
+    if (!entriesOfDays([key]).length) { toast('אין עדיין הקלטות או כתיבות ביום הזה.'); return; }
+    const d = digestFor(key);
+    if (!d.text) { toast('לא נמצא טקסט לתמצת ביום הזה.'); return; }
+    const st = vault.summaries.get(S.summaryId('day', key));
+    if (st && st.edited) {
+      showDaySummary(key);
+      ui.digestPending = { key, text: d.text, d };
+      ui.confirm = 'digest-replace';
+      render();
+      return;
+    }
+    await saveDigest(key, d);
+    showDaySummary(key);
+    toast('התקציר נשמר כסיכום היומי. אפשר לערוך ולשלוח.');
+  },
+  'digest-replace-yes': async () => {
+    const p = ui.digestPending;
+    if (!p) return;
+    await saveDigest(p.key, p.d);
+    ui.digestPending = null; ui.confirm = null;
+    render();
+    toast('הסיכום הוחלף בתקציר.');
+  },
   'sum-rebuild-yes': async () => { await V.deleteSummary(S.summaryId(ui.sumKind, ui.sumKey)); ui.confirm = null; render(); toast('הסיכום נבנה מחדש.'); },
   'share-sum': () => {
     const label = periodLabel(ui.sumKind, ui.sumKey);
@@ -1341,7 +1568,8 @@ const FORMS = {
     render();
   },
   async 'sum-edit'() {
-    await V.saveSummary({ id: S.summaryId(ui.sumKind, ui.sumKey), kind: ui.sumKind, key: ui.sumKey, text: $('#sum-ta').value.trim(), edited: true, editedAt: Date.now() });
+    const prev = vault.summaries.get(S.summaryId(ui.sumKind, ui.sumKey));
+    await V.saveSummary({ id: S.summaryId(ui.sumKind, ui.sumKey), kind: ui.sumKind, key: ui.sumKey, text: $('#sum-ta').value.trim(), edited: true, editedAt: Date.now(), digest: !!(prev && prev.digest) });
     ui.sumEdit = false;
     render();
   },
@@ -1378,6 +1606,7 @@ const FORMS = {
 };
 
 const CHANGES = {
+  'keep-awake': async (el) => { await V.setSettings({ keepAwake: el.value }); await refreshSettings(); V.log('wakelock', 'setting ' + el.value); updateWake(); ui.sd = null; render(); },
   autolock: async (el) => { await V.setSettings({ autolockMin: +el.value }); await refreshSettings(); toast(`נעילה אחרי ${el.value} דקות.`); },
   'rec-audio': async (el) => { await V.setSettings({ recordAudio: el.checked }); await refreshSettings(); },
   'car-mode': async (el) => { await V.setSettings({ carMode: el.checked }); await refreshSettings(); ui.sd = null; render(); },
@@ -1438,5 +1667,5 @@ async function boot() {
   if (wantRec && ui.hasVault) { ui.pendingRec = true; V.log('rec-link', 'locked, recording starts after unlock'); }
   go(ui.hasVault ? 'lock' : 'setup', {}, 'replace');
 }
-if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE };
+if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake };
 boot();

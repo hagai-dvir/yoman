@@ -65,7 +65,12 @@ export function buildDaily(entries) {
 
 // dailyText(dayKey) -> text of that day's summary or ''
 function dayLine(key, text, sentences) {
-  const body = text.split('\n').filter((l) => !/^\d{2}:\d{2} · /.test(l)).join(' ');
+  // Daily text is either the automatic one ("HH:MM · title" lines + sentences) or a digest ("• HH:MM · sentence").
+  const body = text.split('\n')
+    .map((l) => l.replace(/^•\s*(\d{2}:\d{2}\s*·\s*)?/, '\u0001'))
+    .filter((l) => !/^\d{2}:\d{2} · /.test(l))
+    .map((l) => l.replace('\u0001', ''))
+    .join(' ');
   const s = firstSentences(body || text, sentences);
   const d = parseDay(key);
   return `יום ${DAY_NAMES[d.getDay()]} ${short(key)}: ${s}`;

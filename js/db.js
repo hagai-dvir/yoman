@@ -3,8 +3,8 @@
 const qp = new URLSearchParams(location.search).get('db');
 export const TEST_DB = (qp && /^test-[\w-]+$/.test(qp) ? qp : null) || globalThis.__HAMESADER_DB__ || null;
 const DB_NAME = TEST_DB || 'hamesader';
-const DB_VERSION = 2; // v2 adds 'inbox' (quick capture while locked)
-export const STORES = ['meta', 'entries', 'photos', 'blobs', 'audio', 'summaries', 'inbox'];
+const DB_VERSION = 3; // v2 adds 'inbox' (quick capture while locked); v3 adds 'journal' (recording in progress, crash-safe)
+export const STORES = ['meta', 'entries', 'photos', 'blobs', 'audio', 'summaries', 'inbox', 'journal'];
 
 let dbPromise = null;
 
@@ -16,7 +16,7 @@ export function openDb() {
         const d = req.result;
         for (const s of STORES) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'id' });
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => { const d = req.result; d.onversionchange = () => { d.close(); dbPromise = null; }; resolve(d); };
       req.onerror = () => reject(req.error);
     });
   }
@@ -38,6 +38,8 @@ export const getAll = (store) => run(store, 'readonly', (s) => s.getAll());
 export const put = (store, value) => run(store, 'readwrite', (s) => { s.put(value); return null; });
 export const del = (store, id) => run(store, 'readwrite', (s) => { s.delete(id); return null; });
 export const clear = (store) => run(store, 'readwrite', (s) => { s.clear(); return null; });
+export const keys = (store) => run(store, 'readonly', (s) => s.getAllKeys());
+export const delMany = (store, ids) => run(store, 'readwrite', (s) => { for (const id of ids) s.delete(id); return null; });
 
 export async function clearAll() {
   for (const s of STORES) await clear(s);
