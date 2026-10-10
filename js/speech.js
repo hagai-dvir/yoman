@@ -4,7 +4,11 @@
 // the recorder is stopped, the event is logged and the UI is told. Nothing is dropped silently.
 
 import { audioMimeCandidates } from './platform.js';
-import { endsWithPhrase, stripEndPhrase } from './tidy.js';
+import { endsWithPhrase, stripEndPhrase, wordCount } from './tidy.js';
+
+// The end word stops the recording only if nothing is said after it for this long.
+// "ראיתי סרט על דרקון שעף" goes on, so it does not stop; "...דרקון" and then quiet does.
+export const END_CONFIRM_MS = 1500;
 
 export function speechSupported() {
   return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
@@ -28,12 +32,13 @@ export function dedupeFinals(finals) {
 }
 
 export class Recorder {
-  // endPhrase / silenceStopMs: hands-free stopping, only passed when the owner turned on car mode.
+  // endPhrase: the spoken end word, in every recording. silenceStopMs: stop after quiet, car mode only.
   // deviceId: a chosen microphone (Android); recognition then tries to listen to that same track.
   // onChunk(part, seq, blob): every recorded audio chunk, for the crash-safe journal.
   constructor({ lang = 'he-IL', withAudio = true, onUpdate = () => {}, onStatus = () => {}, log = () => {},
-    endPhrase = '', silenceStopMs = 0, deviceId = '', onChunk = () => {} } = {}) {
-    Object.assign(this, { lang, withAudio, onUpdate, onStatus, log, endPhrase, silenceStopMs, deviceId, onChunk });
+    endPhrase = '', endConfirmMs = END_CONFIRM_MS, silenceStopMs = 0, deviceId = '', onChunk = () => {} } = {}) {
+    Object.assign(this, { lang, withAudio, onUpdate, onStatus, log, endPhrase, endConfirmMs, silenceStopMs, deviceId, onChunk });
+    this.endPending = null;    // { words, timer } while the end word was heard and we wait to see if speech goes on
     this.segments = [];        // committed: [{ text, t }]
     this.sessionFinals = [];   // raw finals of the running recognition session
     this.sessionTimes = [];
@@ -218,11 +223,40 @@ export class Recorder {
   emit() {
     const cur = this.currentText();
     this.onUpdate(cur);
-    if (this.endPhrase && !this.handsFreeFired && endsWithPhrase(cur.finalText + ' ' + cur.interim, this.endPhrase)) {
-      this.handsFreeFired = true;
-      this.log('auto-stop', 'end phrase');
-      this.onStatus({ kind: 'end-phrase' });
+    this.checkEndPhrase(cur);
+  }
+
+  // The end word counts only as the last word, and only once nothing more is said for endConfirmMs.
+  // Interim results count too (they are often all there is right after the word), and an interim
+  // "דרקון" that later turns final, or gets punctuation, keeps the same wait instead of restarting it.
+  checkEndPhrase(cur = this.currentText()) {
+    if (!this.endPhrase || this.handsFreeFired || this.stopping) return;
+    const text = cur.finalText + ' ' + cur.interim;
+    if (!endsWithPhrase(text, this.endPhrase)) {
+      if (this.endPending) {
+        clearTimeout(this.endPending.timer);
+        this.endPending = null;
+        this.log('end-phrase', 'cancelled: speech went on');
+        this.onStatus({ kind: 'end-phrase-cancel' });
+      }
+      return;
     }
+    const words = wordCount(text);
+    if (this.endPending && this.endPending.words === words) return; // same words (now final / punctuated): keep waiting
+    const again = !!this.endPending;
+    if (again) clearTimeout(this.endPending.timer);
+    this.endPending = { words, timer: setTimeout(() => this.fireEndPhrase(), this.endConfirmMs) };
+    if (!again) this.onStatus({ kind: 'end-phrase-pending' });
+  }
+
+  fireEndPhrase() {
+    this.endPending = null;
+    if (this.stopping || this.handsFreeFired) return;
+    const cur = this.currentText();
+    if (!endsWithPhrase(cur.finalText + ' ' + cur.interim, this.endPhrase)) return;
+    this.handsFreeFired = true;
+    this.log('auto-stop', 'end phrase');
+    this.onStatus({ kind: 'end-phrase' });
   }
 
   async startAudio() {
@@ -401,6 +435,7 @@ export class Recorder {
 
   async stop() {
     this.stopping = true;
+    if (this.endPending) { clearTimeout(this.endPending.timer); this.endPending = null; }
     const ended = new Promise((res) => { this.endResolve = res; });
     try { this.rec && this.rec.stop(); } catch (e) { /* already stopped */ }
     if (this.hidden) this.gaps.push({ from: this.hiddenFrom, to: this.elapsed() }); // stopped while still in the background

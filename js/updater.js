@@ -38,23 +38,35 @@ export class Updater {
     this.newVersion = null;
     this.log('sw-waiting', '');
     this.onChange();
-    askVersion(w).then((v) => { if (this.waiting === w) { this.newVersion = v; this.onChange(); } });
+    this.versionReady = askVersion(w).then((v) => { if (this.waiting === w) { this.newVersion = v; this.onChange(); } return v; });
   }
 
   get available() { return !!this.waiting && this.waiting.state !== 'redundant'; }
 
   // Asks the browser to look for a new sw.js. Returns 'available' | 'latest' | 'unsupported' | 'error'.
-  async check({ force = false, waitMs = 8000 } = {}) {
+  // updateTimeoutMs: on a stalled connection reg.update() can hang for a long time; then report 'error'.
+  async check({ force = false, waitMs = 8000, updateTimeoutMs = 20000 } = {}) {
     if (!this.supported) return 'unsupported';
     if (!force && Date.now() - this.lastCheck < this.minGapMs) return this.available ? 'available' : 'latest';
     this.lastCheck = Date.now();
-    try { await this.reg.update(); } catch (e) { this.log('sw-update-failed', e.message); return this.available ? 'available' : 'error'; }
+    try {
+      let timer;
+      const stall = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), updateTimeoutMs); });
+      try { await Promise.race([this.reg.update(), stall]); } finally { clearTimeout(timer); }
+    } catch (e) { this.log('sw-update-failed', e.message); return this.available ? 'available' : 'error'; }
     if (this.reg.installing) this.track(this.reg.installing);
     // a new version may still be downloading; give it a few seconds to finish installing
     const t0 = Date.now();
     while (this.reg.installing && Date.now() - t0 < waitMs) await new Promise((r) => setTimeout(r, 200));
     if (this.reg.waiting && this.sw.controller) this.setWaiting(this.reg.waiting);
     return this.available ? 'available' : 'latest';
+  }
+
+  // The waiting version's number (asked from the new service worker; null if it does not answer within 3 s).
+  async waitingVersion() {
+    if (!this.available) return null;
+    if (!this.newVersion && this.versionReady) await this.versionReady;
+    return this.newVersion;
   }
 
   // 'busy' | 'none' | 'applying'

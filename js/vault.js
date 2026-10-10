@@ -19,9 +19,16 @@ export const uid = () => Date.now().toString(36) + '-' + C.toB64(C.rand(9)).repl
 
 // ---------- settings & diagnostics (plain, no content) ----------
 const DEFAULT_SETTINGS = { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, speechFallback: null,
-  carMode: false, endPhrase: 'סיום הקלטה', silenceStopSec: 0, spokenCues: true, micDeviceId: '', ttsRate: 1, keepAwake: 'open' };
+  carMode: false, endPhrase: 'דרקון', endPhraseV: 2, silenceStopSec: 0, spokenCues: true, micDeviceId: '', ttsRate: 1, keepAwake: 'open' };
 export async function getSettings() {
   const s = await db.get('meta', 'settings');
+  // 1.6.2: the owner asked for "דרקון" as the end word. Saved settings from before carry the old
+  // "סיום הקלטה" (or an older choice); switch once. A later change in settings is kept (endPhraseV marks it).
+  if (s && s.endPhraseV !== 2) {
+    s.endPhrase = DEFAULT_SETTINGS.endPhrase;
+    s.endPhraseV = 2;
+    try { await db.put('meta', s); } catch (e) { /* applied in memory now, saved on the next settings change */ }
+  }
   return { ...DEFAULT_SETTINGS, ...(s || {}) };
 }
 export async function setSettings(patch) {
@@ -30,15 +37,22 @@ export async function setSettings(patch) {
   await db.put('meta', next);
   return next;
 }
-export async function log(ev, detail = '') {
-  try {
-    const l = (await db.get('meta', 'log')) || { id: 'log', items: [] };
-    l.items.push({ t: Date.now(), ev, detail: String(detail).slice(0, 120) });
-    if (l.items.length > 200) l.items = l.items.slice(-200);
-    await db.put('meta', l);
-  } catch (e) { /* diagnostics must never break the app */ }
+// Log writes are queued: two writes at once would both read the old list, and one line would be lost.
+let logQueue = Promise.resolve();
+export function log(ev, detail = '') {
+  const item = { t: Date.now(), ev, detail: String(detail).slice(0, 120) };
+  logQueue = logQueue.then(async () => {
+    try {
+      const l = (await db.get('meta', 'log')) || { id: 'log', items: [] };
+      l.items.push(item);
+      if (l.items.length > 200) l.items = l.items.slice(-200);
+      await db.put('meta', l);
+    } catch (e) { /* diagnostics must never break the app */ }
+  });
+  return logQueue;
 }
 export async function getLog() {
+  await logQueue;
   return ((await db.get('meta', 'log')) || { items: [] }).items;
 }
 

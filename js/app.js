@@ -14,7 +14,7 @@ import { WakeKeeper } from './wake.js';
 import { digestDay, browserSummarizer } from './digest.js';
 import { Updater } from './updater.js';
 
-const VERSION = '1.6.1';
+const VERSION = '1.6.2';
 const JOURNAL_TEXT_MS = 8000;   // how often the transcript of a running recording is written to the crash-safe journal
 const wake = new WakeKeeper({ log: (ev, d) => V.log(ev, d) });
 const WORD_PAGE = 1500;        // word buttons rendered at once in the raw view (100K-character entries stay fast)
@@ -40,6 +40,7 @@ const ui = {
   undo: new Map(), rec: null, dict: null, external: false, hasPrf: false, prfMeta: null, bioPending: null,
   sd: null, photoTarget: null, restoreMode: false, settings: { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, carMode: false, quickCapture: false, keepAwake: 'open' },
   quick: false, mics: null, reader: null,
+  upd: null, // result of the last "בדוק עדכונים": { state, version, at }. Kept here so every render shows it again.
 };
 const refreshSettings = async () => { ui.settings = await V.getSettings(); return ui.settings; };
 // Which input path a recording takes, and why (the reason goes to the diagnostics log).
@@ -112,9 +113,56 @@ function renderUpdateBar() {
 }
 function applyUpdate() {
   const r = updater.apply();
-  if (r === 'busy') toast('קודם סיים את מה שפתוח. העדכון יחכה.');
-  else if (r === 'applying') toast('מעדכן… היומן ייטען מחדש, נעול כרגיל.', 8000);
+  const v = updater.newVersion;
+  if (r === 'busy') toast(updMsgText({ state: 'busy', version: v }), 7000);
+  else if (r === 'applying') {
+    // remembered across the reload, so the next start can say "עודכן לגרסה X" (a version marker, not diary content)
+    try { localStorage.setItem(UPD_KEY, JSON.stringify({ from: VERSION, to: v, t: Date.now() })); } catch (e) { /* storage blocked */ }
+    toast(updMsgText({ state: 'applying', version: v }), 12000);
+  }
   return r;
+}
+
+// ---- status of "בדוק עדכונים": lives in ui.upd, so a render (timer, foreground, update bar) never wipes it
+const UPD_KEY = 'yoman-update-from';
+const UPD_MIN_MS = 1000;
+const hhmm = (t) => new Date(t).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+function updMsgText(u) {
+  const v = u.version ? ` ${u.version}` : ' חדשה';
+  switch (u.state) {
+    case 'checking': return 'בודק עדכונים…';
+    case 'latest': return `✓ בדקתי — יש לך את הגרסה האחרונה (${VERSION}). נבדק ב-${hhmm(u.at)}.`;
+    case 'applying': return `נמצאה גרסה${v} — מעדכן… היומן ייטען מחדש, נעול כרגיל.`;
+    case 'busy': return `יש גרסה${v} — היא תותקן כשתסיים את ההקלטה/הכתיבה.`;
+    case 'updated': return `✓ עודכן לגרסה ${VERSION}.`;
+    case 'offline': return 'אין חיבור לאינטרנט, ולכן אי אפשר לבדוק עדכונים עכשיו. נסה שוב כשתהיה מחובר.';
+    case 'unsupported': return 'בדפדפן הזה אין בדיקת עדכונים (אין service worker).';
+    case 'failed': return 'נמצאה גרסה חדשה, אבל לא הצלחתי להתחיל את העדכון. נסה שוב.';
+    default: return `לא הצלחתי לבדוק עדכונים (השרת לא ענה). נסה שוב בעוד רגע. נבדק ב-${hhmm(u.at)}.`;
+  }
+}
+const UPD_TONE = { latest: 'ok', updated: 'ok', checking: 'work', applying: 'work', busy: 'wait' };
+function updStatusHtml() {
+  const u = ui.upd;
+  return `<p class="upd-status${u ? ' ' + (UPD_TONE[u.state] || 'bad') : ''}" id="upd-msg" role="status" aria-live="polite"${u ? '' : ' hidden'}>${u ? esc(updMsgText(u)) : ''}</p>`;
+}
+const updWorking = () => !!ui.upd && (ui.upd.state === 'checking' || ui.upd.state === 'applying');
+function updButtonLabel() { return updWorking() ? (ui.upd.state === 'checking' ? 'בודק…' : 'מעדכן…') : updater.available ? 'עדכן עכשיו' : 'בדוק עדכונים'; }
+// Shows ui.upd now, in place, without a full render (a full render would also reset open <details> etc.).
+function setUpd(state, extra = {}) {
+  ui.upd = { state, at: Date.now(), ...extra };
+  const m = $('#upd-msg');
+  if (m) m.outerHTML = updStatusHtml();
+  const b = $('[data-act="check-update"]');
+  if (b) { b.disabled = updWorking(); b.innerHTML = icon('download') + updButtonLabel(); }
+}
+// After a reload into a new version: say so once.
+function announceUpdate() {
+  let m = null;
+  try { m = JSON.parse(localStorage.getItem(UPD_KEY) || 'null'); localStorage.removeItem(UPD_KEY); } catch (e) { return; }
+  if (!m || Date.now() - m.t > 10 * 60000) return;
+  if (m.from !== VERSION) { ui.upd = { state: 'updated', at: Date.now() }; V.log('sw-updated', `${m.from}→${VERSION}`); toast(`✓ עודכן לגרסה ${VERSION}.`, 8000); }
+  else toast('העדכון לא הושלם, והיומן נשאר בגרסה הקודמת. אפשר לנסות שוב בהגדרות, ב"גרסה ועדכונים".', 9000);
 }
 function checkUpdatesQuietly() { updater.check().then(renderUpdateBar).catch(() => {}); }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) checkUpdatesQuietly(); });
@@ -350,7 +398,7 @@ const SCREENS = {
     const car = ui.settings.carMode;
     const phrase = ui.settings.endPhrase || '';
     const silence = car && ui.settings.silenceStopSec ? ui.settings.silenceStopSec : 0;
-    const handsFree = [phrase ? `אמור "${esc(phrase)}" כדי לסיים` : '', silence ? `ההקלטה תיעצר אחרי ${silence} שניות שקט` : ''].filter(Boolean).join(' · ');
+    const handsFree = [phrase ? `כדי לסיים, אמור "${esc(phrase)}" ושתוק רגע` : '', silence ? `ההקלטה תיעצר אחרי ${silence} שניות שקט` : ''].filter(Boolean).join(' · ');
     return `<main class="scr rec-scr${car ? ' car' : ''}">${wave('bl')}
     ${ui.quick ? '<p class="quick-badge">הקלטה מהירה · היומן נשאר נעול, וההקלטה תיכנס אליו כשתפתח אותו</p>' : ''}
     <div class="row split"><span class="sticker"><i></i><span id="rec-time">00:00</span></span><span class="rec-status" id="rec-status">מתחיל…</span></div>
@@ -579,10 +627,10 @@ const SCREENS = {
       </details>
       <details class="card"${d.settings.carMode ? ' open' : ''}><summary>נהיגה ודיבורית</summary>
         <label class="switch"><span>מצב נהיגה: צלילים, כפתור עצירה ענק, וסיום בלי ידיים</span><input type="checkbox" data-change="car-mode" ${d.settings.carMode ? 'checked' : ''}></label>
-        <label class="field">מילת סיום (נמחקת מהטקסט). השאר ריק כדי לכבות<input id="end-phrase" data-change="end-phrase" value="${esc(d.settings.endPhrase || '')}" autocomplete="off"></label>
+        <label class="field">מילת סיום (לא נכנסת לטקסט). השאר ריק כדי לכבות<input id="end-phrase" data-change="end-phrase" value="${esc(d.settings.endPhrase || '')}" placeholder="דרקון" autocomplete="off"></label>
         <label class="field">עצירה אוטומטית אחרי שקט<select id="silence-stop" data-change="silence-stop">${[[0, 'כבוי'], [20, '20 שניות'], [30, '30 שניות'], [60, 'דקה'], [120, '2 דקות']].map(([v, l]) => `<option value="${v}" ${d.settings.silenceStopSec === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
         <label class="switch"><span>לומר "נשמר" בסוף (בנוסף לצליל)</span><input type="checkbox" data-change="spoken-cues" ${d.settings.spokenCues ? 'checked' : ''}></label>
-        <p class="note">מילת הסיום פועלת בכל הקלטה, אבל רק כשהיומן מוצג על המסך (ברקע המילים לא מתומללות, ולכן גם היא לא נשמעת). העצירה אחרי שקט פועלת רק במצב נהיגה.</p>
+        <p class="note">${d.settings.endPhrase ? `אומרים "${esc(d.settings.endPhrase)}" בסוף, ושותקים רגע: ההקלטה נעצרת ונשמרת, והמילה לא נכנסת לטקסט. אם ממשיכים לדבר מיד אחריה (למשל "ראיתי דרקון שעף"), ההקלטה לא נעצרת. אבל אם המילה היא האחרונה במשפט ואחריה יש הפסקה של שנייה וחצי, ההקלטה תיעצר, גם אם לא התכוונת. ` : ''}מילת הסיום פועלת בכל הקלטה, אבל רק כשהיומן מוצג על המסך (ברקע המילים לא מתומללות, ולכן גם היא לא נשמעת). העצירה אחרי שקט פועלת רק במצב נהיגה.</p>
         ${P.isIOS
           ? '<p class="note">באייפון הדפדפן לא יכול לבחור מיקרופון. כשדיבורית הרכב או אוזניות בלוטות\' מחוברות, האייפון בדרך כלל משתמש במיקרופון שלהן. במסך ההקלטה כתוב איזה מיקרופון פעיל, כשאפשר לדעת.</p>'
           : `<label class="field">מיקרופון<select id="mic" data-change="mic"><option value="">ברירת המחדל של הטלפון</option>${(ui.mics || []).map((m) => `<option value="${esc(m.deviceId)}" ${d.settings.micDeviceId === m.deviceId ? 'selected' : ''}>${esc(m.label || 'מיקרופון')}</option>`).join('')}</select></label>
@@ -644,8 +692,8 @@ const SCREENS = {
       <section class="card upd-card"><h2>גרסה ועדכונים</h2>
         <p>הגרסה שלך: <b dir="ltr">${VERSION}</b></p>
         ${updater.available ? `<p class="notice">יש גרסה חדשה${updater.newVersion ? ` (<span dir="ltr">${esc(updater.newVersion)}</span>)` : ''}, מוכנה להתקנה.</p>` : ''}
-        <button class="btn wide" data-act="check-update">${icon('download')}${updater.available ? 'עדכן עכשיו' : 'בדוק עדכונים'}</button>
-        <p class="note" id="upd-msg" aria-live="polite"></p>
+        <button class="btn wide" data-act="check-update"${updWorking() ? ' disabled' : ''}>${icon('download')}${updButtonLabel()}</button>
+        ${updStatusHtml()}
         <p class="note">העדכון לא נוגע ביומן עצמו: הכול נשאר מוצפן בטלפון. אחרי העדכון היומן נפתח נעול, כרגיל.</p>
       </section>
       <details class="card"><summary>אבחון</summary>
@@ -745,7 +793,8 @@ async function startRecording(pathReason = 'default', opts = {}) {
   const journalId = V.uid();
   const r = new Recorder({
     withAudio: settings.recordAudio,
-    // The end phrase works in every recording (it is unlikely to be said by accident); silence-stop only in car mode.
+    // The end word works in every recording, as the last word followed by a short pause (see END_CONFIRM_MS);
+    // silence-stop only in car mode.
     endPhrase: settings.endPhrase || '',
     silenceStopMs: car ? (settings.silenceStopSec || 0) * 1000 : 0,
     deviceId: P.isIOS ? '' : (settings.micDeviceId || ''),
@@ -766,6 +815,8 @@ async function startRecording(pathReason = 'default', opts = {}) {
       if (s.kind === 'fatal') { toast(P.isIOS ? 'אין הרשאה למיקרופון או לזיהוי דיבור. אפשר לאשר בהגדרות > Safari, ולוודא שההכתבה (Siri ודיבור) מופעלת.' : 'אין הרשאה למיקרופון או לזיהוי דיבור. אפשר לאשר בהגדרות האתר ב-Chrome.', 8000); finishRecording('fatal'); }
       if (s.kind === 'need-tap') { const b = $('#rec-resume'); if (b) b.hidden = false; if (st) st.textContent = 'הזיהוי נעצר וממתין לנגיעה'; if (car) VO.beep('alert'); }
       if (s.kind === 'unavailable') switchToDictation(s.reason);
+      if (s.kind === 'end-phrase-pending' && st) st.textContent = `שמעתי "${settings.endPhrase}". עוצר, אלא אם תמשיך לדבר…`;
+      if (s.kind === 'end-phrase-cancel' && st) st.textContent = 'מקשיב…';
       if (s.kind === 'end-phrase' || s.kind === 'silence-stop') finishRecording(s.kind);
       if (s.kind === 'mic') { const m = $('#rec-mic'); if (m) m.textContent = 'מיקרופון: ' + (s.label || 'לא ידוע'); }
       if (s.kind === 'back') backFromBackground(s);
@@ -1483,16 +1534,34 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
   'sum-edit': () => { ui.sumEdit = true; render(); },
   'sum-cancel': () => { ui.sumEdit = false; render(); },
   'sum-rebuild': () => { ui.confirm = 'sum-rebuild'; render(); },
-  'check-update': async (el) => {
-    const msg = (t) => { const m = $('#upd-msg'); if (m) m.textContent = t; };
-    msg('');
-    const r = updater.available ? 'available' : await busy(el, 'בודק…', () => updater.check({ force: true }));
-    renderUpdateBar();
+  // Every tap gets a visible answer: a status line (kept in ui.upd, so it survives renders) and a toast.
+  // "בודק עדכונים…" stays at least UPD_MIN_MS, so a fast "nothing new" does not look like nothing happened.
+  'check-update': async () => {
+    if (updWorking()) return;
+    setUpd('checking');
+    toast('בודק עדכונים…', 30000);
+    let r;
+    if (updater.available) r = 'available';
+    else {
+      [r] = await Promise.all([
+        updater.check({ force: true }).catch(() => 'error'),
+        new Promise((res) => setTimeout(res, UPD_MIN_MS)),
+      ]);
+    }
+    if (r === 'error' && navigator.onLine === false) r = 'offline';
     if (r === 'available') {
-      if (applyUpdate() === 'none') msg('לא הצלחתי להתחיל את העדכון. נסה שוב.');
-    } else if (r === 'latest') msg(`יש לך את הגרסה האחרונה (${VERSION}).`);
-    else if (r === 'unsupported') msg('בדפדפן הזה אין בדיקת עדכונים (אין service worker).');
-    else msg('לא הצלחתי לבדוק. אולי אין חיבור לאינטרנט.');
+      const version = await updater.waitingVersion();
+      const a = applyUpdate(); // its own toast: "נמצאה גרסה X — מעדכן…" or "…תותקן כשתסיים"
+      setUpd(a === 'applying' ? 'applying' : a === 'busy' ? 'busy' : 'failed', { version });
+      if (a === 'none') toast(updMsgText(ui.upd), 7000);
+      // the page normally reloads within seconds; if it is still here, free the button again
+      if (a === 'applying') setTimeout(() => { if (ui.upd && ui.upd.state === 'applying') setUpd('failed', { version }); }, 15000);
+    } else {
+      setUpd(r);
+      toast(updMsgText(ui.upd), r === 'latest' ? 5000 : 8000);
+    }
+    V.log('update-check', ui.upd.state + (ui.upd.version ? ' ' + ui.upd.version : ''));
+    renderUpdateBar();
   },
   // A summary the owner edited is never replaced without his explicit "החלף בתקציר".
   'digest-day': async (el) => {
@@ -1723,6 +1792,7 @@ async function boot() {
   }
   if (wantRec && ui.hasVault) { ui.pendingRec = true; V.log('rec-link', 'locked, recording starts after unlock'); }
   go(ui.hasVault ? 'lock' : 'setup', {}, 'replace');
+  announceUpdate();
 }
-if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake, updater, renderUpdateBar, VERSION };
+if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake, updater, renderUpdateBar, VERSION, announceUpdate, UPD_KEY };
 boot();

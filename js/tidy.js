@@ -155,34 +155,54 @@ export function dictationSegments(text, marks) {
   return segs;
 }
 
-// ---- hands-free end phrase (e.g. "סיום הקלטה") ----
-const phraseTokens = (p) => tokenize(p || '').map(norm).filter(Boolean);
+// ---- hands-free end word (default "דרקון", since 1.6.2) ----
+export const DEFAULT_END_PHRASE = 'דרקון';
+// Other spellings the recognizer may produce for the same spoken end word.
+// "dragon": Chrome's Hebrew recognizer sometimes writes a word that sounds English in Latin letters.
+const END_ALIASES = { 'דרקון': [['dragon']] };
+// Letters and digits only, lower case: "דרקון." / "דרקון!" / "(דרקון)" / "Dragon," all compare equal.
+const endNorm = (w) => w.replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+const endTokens = (text) => tokenize(text || '').map(endNorm).filter(Boolean);
+const HEB = /^[א-ת]/;
+// The first word may carry a Hebrew prefix the recognizer glued on: "הדרקון", "ודרקון", "והדרקון".
+function wordMatches(got, want, first) {
+  if (got === want) return true;
+  if (!first || !HEB.test(want) || !got.endsWith(want)) return false;
+  return ['ה', 'ו', 'וה'].includes(got.slice(0, got.length - want.length));
+}
+// How many words at the end of the text are the end phrase (0 = it does not end with it).
+function endMatchLen(tokens, phrase) {
+  const main = endTokens(phrase);
+  if (!main.length) return 0;
+  for (const p of [main, ...(END_ALIASES[main.join(' ')] || [])]) {
+    if (tokens.length < p.length) continue;
+    const tail = tokens.slice(-p.length);
+    if (p.every((w, i) => wordMatches(tail[i], w, i === 0))) return p.length;
+  }
+  return 0;
+}
 
 // True when the spoken text ends with the end phrase.
 export function endsWithPhrase(text, phrase) {
-  const p = phraseTokens(phrase);
-  if (!p.length) return false;
-  const t = tokenize(text || '').map(norm).filter(Boolean);
-  if (t.length < p.length) return false;
-  return p.every((w, i) => t[t.length - p.length + i] === w);
+  return endMatchLen(endTokens(text), phrase) > 0;
 }
+
+// Number of real words in a text (punctuation-only tokens do not count).
+export const wordCount = (text) => endTokens(text).length;
 
 // Removes the end phrase from the end of the segments (it may be split across the last two segments).
 export function stripEndPhrase(segments, phrase) {
-  const p = phraseTokens(phrase);
-  if (!p.length) return segments;
   const segs = segments.map((s) => ({ ...s }));
-  let remaining = p.length;
-  const flat = segs.flatMap((s) => tokenize(s.text)).map(norm).filter(Boolean);
-  if (!endsWithPhrase(flat.join(' '), phrase)) return segments;
+  let remaining = endMatchLen(endTokens(segs.map((s) => s.text).join(' ')), phrase);
+  if (!remaining) return segments;
   for (let i = segs.length - 1; i >= 0 && remaining > 0; i--) {
     const words = tokenize(segs[i].text);
     // drop trailing empty-after-normalising tokens (punctuation) together with the phrase words
     while (words.length && remaining > 0) {
       const w = words.pop();
-      if (norm(w)) remaining--;
+      if (endNorm(w)) remaining--;
     }
-    segs[i].text = words.join(' ');
+    segs[i].text = words.join(' ').replace(/[\s,;:\-–]+$/, ''); // "היה יום טוב, דרקון" -> "היה יום טוב"
   }
   return segs.filter((s) => s.text.trim());
 }
