@@ -152,6 +152,34 @@ export function effects(atoms) {
   return out;
 }
 
+// One photo, for real: the recordings that point to it stop pointing to it, then its record (with the location in it)
+// and both blobs (full size + thumbnail) leave IndexedDB. markAt: stamp the recordings with photosDeletedAt (the
+// "מחיקת נתונים" notice). Returns the ids of the recordings that changed; the caller saves them.
+async function dropPhoto(id, markAt = null) {
+  const p = vault.photos.get(id);
+  if (!p) return [];
+  const changed = [];
+  for (const e of vault.entries.values()) {
+    if ((e.photoIds || []).includes(id) || p.entryId === e.id) {
+      e.photoIds = (e.photoIds || []).filter((x) => x !== id);
+      if (markAt) e.photosDeletedAt = markAt;
+      changed.push(e.id);
+    }
+  }
+  await V.deletePhoto(id);
+  return changed;
+}
+
+// 1.6.5 "מחק תמונה" in the photo viewer: one photo and its location. The recording and its text always stay,
+// even if this was its last photo (unlike "מחיקת נתונים", which removes a recording left with nothing in it).
+export async function deleteOnePhoto(id) {
+  if (!V.isUnlocked()) throw Object.assign(new Error('locked'), { code: 'locked' });
+  if (!vault.photos.has(id)) return { deleted: false, entries: [] };
+  const changed = await dropPhoto(id);
+  for (const eid of changed) { const e = vault.entries.get(eid); if (e) await V.saveEntry(e); }
+  return { deleted: true, entries: changed };
+}
+
 // Deletes exactly the given atoms. Nothing at all is deleted before auth ({ password } or { prf }) is verified.
 // opts.isRecording(): true while a recording runs; then nothing is deleted.
 export async function execute(atoms, auth, opts = {}) {
@@ -167,14 +195,7 @@ export async function execute(atoms, auth, opts = {}) {
 
   for (const id of by.photos) {
     if (!vault.photos.has(id)) continue;
-    for (const e of vault.entries.values()) {
-      if ((e.photoIds || []).includes(id) || vault.photos.get(id).entryId === e.id) {
-        e.photoIds = (e.photoIds || []).filter((x) => x !== id);
-        e.photosDeletedAt = now;
-        dirty.add(e.id);
-      }
-    }
-    await V.deletePhoto(id);
+    for (const eid of await dropPhoto(id, now)) dirty.add(eid);
     done.photos++;
   }
   for (const id of by.locations) {

@@ -14,8 +14,9 @@ import { WakeKeeper } from './wake.js';
 import { digestDay, browserSummarizer } from './digest.js';
 import { Updater } from './updater.js';
 import * as WP from './wipe.js';
+import { attachGestures } from './zoom.js';
 
-const VERSION = '1.6.4';
+const VERSION = '1.6.5';
 const JOURNAL_TEXT_MS = 8000;   // how often the transcript of a running recording is written to the crash-safe journal
 const wake = new WakeKeeper({ log: (ev, d) => V.log(ev, d) });
 const WORD_PAGE = 1500;        // word buttons rendered at once in the raw view (100K-character entries stay fast)
@@ -52,7 +53,7 @@ const fmtWhen = (ms) => fmtDay(S.dayKey(ms));
 const ui = {
   screen: 'boot', lastScreen: null,
   entryId: null, entryTab: 'raw', libTab: 'raw', sumKind: 'day', sumKey: null,
-  word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewPhoto: null,
+  word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewer: null, newPhotos: null,
   undo: new Map(), rec: null, dict: null, external: false, hasPrf: false, prfMeta: null, bioPending: null,
   sd: null, photoTarget: null, restoreMode: false, settings: { autolockMin: 3, recordAudio: true, inputMode: 'auto', lastBackupAt: 0, carMode: false, quickCapture: false, keepAwake: 'open' },
   quick: false, mics: null, reader: null,
@@ -71,7 +72,7 @@ function chooseInputPath() {
 }
 
 // ---------------------------------------------------------------- navigation
-const TRANSIENT = { word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewPhoto: null, wordLimit: WORD_PAGE };
+const TRANSIENT = { word: null, freeEdit: false, tidyEdit: false, sumEdit: false, confirm: null, viewer: null, wordLimit: WORD_PAGE };
 function go(screen, patch = {}, mode = 'push') {
   Object.assign(ui, TRANSIENT, patch, { screen });
   const st = { screen, entryId: ui.entryId, entryTab: ui.entryTab, libTab: ui.libTab, sumKind: ui.sumKind, sumKey: ui.sumKey };
@@ -80,6 +81,9 @@ function go(screen, patch = {}, mode = 'push') {
   render();
 }
 window.addEventListener('popstate', (e) => {
+  // The photo viewer has its own history entry, so "back" (Android, or a swipe) closes it and stays on the screen.
+  if (ui.viewerPop) { ui.viewerPop = false; return; } // the entry was removed by closeViewer() itself
+  if (ui.viewer) { ui.viewer = null; renderViewer(); return; }
   if (ui.rec || ui.dict) { history.pushState({ screen: 'record' }, ''); return; } // never leave a running recording by "back"
   if (!V.isUnlocked()) return;
   if (ui.screen === 'write') saveDraftNow();
@@ -93,7 +97,8 @@ function render() {
   const lockedOk = ['setup', 'lock', 'boot'].concat(ui.quick ? ['record', 'dictate', 'tapstart', 'quickDone'] : []);
   if (!V.isUnlocked() && !lockedOk.includes(ui.screen)) ui.screen = ui.hasVault ? 'lock' : 'setup';
   const fn = SCREENS[ui.screen] || SCREENS.today;
-  app.innerHTML = fn() + (ui.viewPhoto ? viewer() : '');
+  app.innerHTML = fn();
+  renderViewer();
   if (ui.screen !== ui.lastScreen) { window.scrollTo(0, 0); ui.lastScreen = ui.screen; }
   hydrate();
   app.querySelectorAll('textarea.grow').forEach(grow);
@@ -108,7 +113,7 @@ function render() {
 // ---------------------------------------------------------------- version updates
 // Busy = something unsaved could be lost by a reload: a recording, dictation, the writing screen, an open edit form,
 // or a share sheet / picker in progress. The update bar waits until none of these is true.
-const updateBusy = () => !!(ui.rec || ui.dict || ui.external || ui.wiping || ui.sumEdit || ui.freeEdit || ui.tidyEdit || ui.word
+const updateBusy = () => !!(ui.rec || ui.dict || ui.external || ui.wiping || ui.viewer || ui.sumEdit || ui.freeEdit || ui.tidyEdit || ui.word
   || ['record', 'dictate', 'tapstart', 'write', 'boot'].includes(ui.screen));
 const updater = new Updater({ current: VERSION, isBusy: updateBusy, onChange: () => renderUpdateBar(), log: (ev, d) => V.log(ev, d) });
 function renderUpdateBar() {
@@ -192,11 +197,12 @@ function updateWake() {
   wake.want(mode !== 'off' && (busy || (mode === 'open' && open)), ui.screen);
 }
 
-async function hydrate() {
-  for (const img of app.querySelectorAll('img[data-blob]')) {
-    try { const u = await V.blobUrl(img.dataset.blob, 'image/jpeg'); if (u) img.src = u; } catch (e) { /* locked meanwhile */ }
+async function hydrate(root = app) {
+  for (const img of root.querySelectorAll('img[data-blob]')) {
+    if (img.src) continue;
+    try { const u = await V.blobUrl(img.dataset.blob, 'image/jpeg'); if (u && img.isConnected) img.src = u; } catch (e) { /* locked meanwhile */ }
   }
-  for (const au of app.querySelectorAll('audio[data-audio]')) {
+  for (const au of root.querySelectorAll('audio[data-audio]')) {
     try { const u = await V.audioUrl(au.dataset.audio, au.dataset.mime); if (u) au.src = u; } catch (e) { /* ignore */ }
   }
 }
@@ -302,26 +308,111 @@ function confirmBox(key, text, yesAct, yesLabel) {
   return `<div class="confirm" role="alert"><p>${esc(text)}</p><div class="row"><button class="btn danger" data-act="${yesAct}">${esc(yesLabel)}</button><button class="btn ghost" data-act="confirm-cancel">ביטול</button></div></div>`;
 }
 
-function photosHtml(photos, deletable) {
-  return photos.map((p) => `<figure class="ph">
-    <button class="icon-btn" style="all:unset;cursor:pointer" data-act="photo-view" data-id="${p.id}" aria-label="הגדל תמונה"><img data-blob="${p.thumbId}" alt="תמונה מ-${S.short(p.dayKey)}"></button>
-    ${p.lat != null ? `<a href="${mapsUrl(p.lat, p.lng)}" target="_blank" rel="noopener noreferrer">${icon('pin')}גוגל מפות</a>` : '<span class="nogps">אין מיקום</span>'}
-    ${deletable ? `<button class="ph-del" data-act="photo-del" data-id="${p.id}">${ui.confirm === 'photo:' + p.id ? 'לחץ שוב להסרה' : 'הסר'}</button>` : ''}
-  </figure>`).join('');
+// Thumbnails. The grid carries its photo ids in order, so the viewer swipes through exactly this set
+// (the photos of one recording, of one day, or all of them in "התמונות שלי").
+// 1.6.5: the old markup (<figure> with its default 40px margins, and a button with all:unset) squeezed every
+// thumbnail to a ~16px speck, in Safari and in Chrome alike.
+function photosHtml(photos, { caption = null } = {}) {
+  const fresh = ui.newPhotos || new Set();
+  return `<div class="photos" data-ids="${photos.map((p) => p.id).join(',')}">${photos.map((p) => `<figure class="ph${fresh.has(p.id) ? ' new' : ''}" data-photo="${p.id}">
+    <button class="ph-open" data-act="photo-view" data-id="${p.id}" aria-label="פתח את התמונה מ-${S.short(p.dayKey)} במסך מלא"><img data-blob="${p.thumbId}" alt="תמונה מ-${S.short(p.dayKey)}"></button>
+    ${caption ? `<figcaption>${caption(p)}</figcaption>` : ''}
+    ${p.lat != null ? `<a href="${mapsUrl(p.lat, p.lng)}" target="_blank" rel="noopener noreferrer">${icon('pin')}מפה</a>` : ''}
+  </figure>`).join('')}</div>`;
+}
+// The recording a photo belongs to, if any (a photo can also belong to a day only).
+const photoOwner = (p) => (p.entryId && vault.entries.get(p.entryId)) || [...vault.entries.values()].find((e) => (e.photoIds || []).includes(p.id)) || null;
+const photosOfEntry = (e) => (e.photoIds || []).map((id) => vault.photos.get(id)).filter(Boolean);
+const allPhotosNewestFirst = () => [...vault.photos.values()].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+// A small thumbnail on a recording in the lists, so a recording with photos is recognisable.
+function entryPhotoBadge(e) {
+  const ps = photosOfEntry(e);
+  if (!ps.length) return '';
+  return `<span class="it-ph"><img data-blob="${ps[0].thumbId}" alt="">${ps.length === 1 ? 'תמונה אחת' : `${ps.length} תמונות`}</span>`;
 }
 const photoButtons = (dayKey, entryId = '') => `<div class="row">
   <button class="chip" data-act="photo" data-src="camera" data-day="${dayKey}" data-entry="${entryId}">${icon('camera')}צלם</button>
   <button class="chip" data-act="photo" data-src="gallery" data-day="${dayKey}" data-entry="${entryId}">${icon('image')}מהגלריה</button></div>`;
 
+// ---- 1.6.5 full-screen photo viewer: ui.viewer = { ids, i, ask }. It is drawn over the screen and updated in
+// place (swipe, delete question), so the screen under it is not rebuilt on every swipe.
+const viewerIds = () => (ui.viewer ? ui.viewer.ids.filter((id) => vault.photos.has(id)) : []);
 function viewer() {
-  const p = vault.photos.get(ui.viewPhoto);
-  if (!p) return '';
+  const v = ui.viewer;
+  const ids = viewerIds();
+  if (!v || !ids.length || !V.isUnlocked()) return '';
+  v.ids = ids;
+  v.i = Math.max(0, Math.min(v.i, ids.length - 1));
+  const p = vault.photos.get(ids[v.i]);
+  const n = ids.length;
   const when = p.takenAt ? `${S.short(S.dayKey(p.takenAt))} · ${S.timeOf(p.takenAt)}` : S.short(p.dayKey);
   const src = { gps: 'מיקום מהטלפון בזמן הצילום', exif: 'מיקום מתוך נתוני התמונה' }[p.locSource] || (p.locDeletedAt ? 'המיקום של התמונה נמחק' : 'לתמונה הזו אין מיקום');
-  return `<div class="viewer" role="dialog" aria-label="תמונה">
-    <img data-blob="${p.blobId}" alt="תמונה">
-    <div class="row split"><span>${esc(when)} · ${src}</span>${p.lat != null ? `<a href="${mapsUrl(p.lat, p.lng)}" target="_blank" rel="noopener noreferrer">${icon('pin')}פתח בגוגל מפות</a>` : ''}</div>
-    <button class="btn" data-act="viewer-close">סגור</button></div>`;
+  const owner = photoOwner(p);
+  const from = owner ? `מתוך ההקלטה: ${esc(entryTitle(owner))}` : `תמונה של יום ${S.short(p.dayKey)}`;
+  return `<div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="תמונה ${v.i + 1} מתוך ${n}">
+    <div class="vw-top"><span class="vw-count">${n > 1 ? `${v.i + 1} מתוך ${n}` : ''}</span><span>${esc(when)}</span></div>
+    <div class="vw-stage" id="vw-stage"><img id="vw-img" data-blob="${p.blobId}" alt="התמונה במסך מלא" draggable="false">
+      ${n > 1 ? `<button class="vw-arrow prev" data-act="vw-step" data-dir="-1" aria-label="התמונה הקודמת">${icon('back')}</button><button class="vw-arrow next" data-act="vw-step" data-dir="1" aria-label="התמונה הבאה">${icon('next')}</button>` : ''}</div>
+    <p class="vw-meta">${from}<br>${src}</p>
+    <p class="vw-hint">${n > 1 ? 'החלק הצידה למעבר בין התמונות. ' : ''}צביטה או נגיעה כפולה מגדילות.</p>
+    <div class="vw-actions">
+      ${p.lat != null ? `<a class="btn honey" href="${mapsUrl(p.lat, p.lng)}" target="_blank" rel="noopener noreferrer" data-vw="map">${icon('pin')}הצג במפה</a>` : ''}
+      <button class="btn red" data-act="vw-del">${icon('trash')}מחק תמונה</button>
+      <button class="btn vw-close" data-act="viewer-close">סגור</button>
+    </div>
+    ${v.ask ? `<div class="vw-ask" role="alertdialog" aria-modal="true" aria-labelledby="vw-ask-t"><div class="vw-ask-box">
+      <img data-blob="${p.thumbId}" alt="התמונה שתימחק">
+      <p id="vw-ask-t" class="vw-ask-q">למחוק את התמונה? אין דרך חזרה</p>
+      <p class="note">${owner ? 'ההקלטה והטקסט שלה נשארים. ' : ''}גם המיקום של התמונה יימחק.</p>
+      <div class="row"><button class="btn red" data-act="vw-del-yes">${icon('trash')}כן, מחק</button><button class="btn ghost" data-act="vw-del-no">ביטול</button></div>
+    </div></div>` : ''}
+  </div>`;
+}
+function renderViewer() {
+  const old = $('#viewer');
+  const html = ui.viewer ? viewer() : '';
+  if (!html) ui.viewer = null;
+  document.documentElement.classList.toggle('vw-open', !!html);
+  if (!html) { if (old) old.remove(); renderUpdateBar(); return; }
+  if (old) old.outerHTML = html; else app.insertAdjacentHTML('beforeend', html);
+  const el = $('#viewer');
+  hydrate(el);
+  const stage = $('#vw-stage', el);
+  if (stage) attachGestures(stage, { onSwipe: (dir) => viewerStep(dir) });
+  const f = $(ui.viewer.ask ? '[data-act="vw-del-no"]' : '[data-act="viewer-close"]', el);
+  if (f) f.focus({ preventScroll: true });
+  renderUpdateBar();
+}
+function openViewer(ids, i = 0) {
+  ui.viewer = { ids, i: Math.max(0, i), ask: false };
+  try { history.pushState({ ...(history.state || {}), viewer: true }, ''); } catch (e) { /* ignore */ }
+  renderViewer();
+}
+function closeViewer() {
+  ui.viewer = null;
+  renderViewer();
+  if (history.state && history.state.viewer) { ui.viewerPop = true; history.back(); }
+}
+function viewerStep(dir) {
+  const v = ui.viewer;
+  const n = viewerIds().length;
+  if (!v || n < 2 || v.ask) return false;
+  v.i = (v.i + dir + n) % n;
+  renderViewer();
+  return true;
+}
+async function deleteViewedPhoto(btn) {
+  const v = ui.viewer;
+  if (!v) return;
+  const id = v.ids[v.i];
+  const owner = vault.photos.has(id) ? photoOwner(vault.photos.get(id)) : null;
+  if (btn) btn.disabled = true;
+  await WP.deleteOnePhoto(id); // the same deletion as "מחיקת נתונים": record, both blobs and the location
+  V.log('photo-deleted', 'viewer');
+  v.ask = false;
+  const left = viewerIds().length;
+  if (!left) { closeViewer(); render(); } else render();
+  toast(owner ? 'התמונה נמחקה. ההקלטה והטקסט שלה נשארו.' : 'התמונה נמחקה.');
 }
 
 // ---------------------------------------------------------------- screens
@@ -401,10 +492,10 @@ const SCREENS = {
     ${backupNudge()}
     <section class="card"><h2>ההקלטות של היום</h2>
       ${es.length ? `<div class="list">${es.map((e) => `<div class="item"><button class="item-main" data-act="open-entry" data-id="${e.id}" data-tab="tidy">
-        <span class="d"><span>${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span><span class="t"><b>${esc(entryTitle(e))}</b></span></button></div>`).join('')}</div>` : '<p class="muted">עוד לא הקלטת היום.</p>'}
+        <span class="d"><span>${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span><span class="t"><b>${esc(entryTitle(e))}</b></span>${entryPhotoBadge(e)}</button></div>`).join('')}</div>` : '<p class="muted">עוד לא הקלטת היום.</p>'}
     </section>
-    <section class="card"><h2>תמונות של היום</h2>
-      ${ps.length ? `<div class="photos">${photosHtml(ps, false)}</div>` : '<p class="muted">אין עדיין תמונות.</p>'}
+    <section class="card" id="day-photos"><h2>תמונות של היום</h2>
+      ${ps.length ? `${photosHtml(ps)}<p class="note">נגיעה בתמונה פותחת אותה בגדול. שם אפשר גם למחוק אותה.</p>` : '<p class="muted">אין עדיין תמונות.</p>'}
       ${photoButtons(k)}</section>
     <section class="card"><h2>סיכום היום</h2>
       ${sum ? `<p class="sumtext${isDigest ? ' digest' : ''}">${esc(isDigest ? sum : S.firstSentences(sum.replace(/\n/g, ' '), 3))}</p>` : '<p class="muted">הסיכום ייבנה מההקלטות של היום.</p>'}
@@ -534,14 +625,17 @@ const SCREENS = {
     }
     if (e.recovered) audio += '<p class="note">ההקלטה הזו נקטעה כשהיומן נסגר, ושוחזרה מהשמירה השוטפת. ייתכן שהשניות האחרונות חסרות.</p>';
     if (e.audioNote) audio += `<p class="note">${esc(conflictText(e.audioNote))}</p>`;
-    const photos = (e.photoIds || []).map((id) => vault.photos.get(id)).filter(Boolean);
+    const photos = photosOfEntry(e);
+    // With photos, they sit right under the header, where they are seen without scrolling past the text.
+    const photoCard = `<section class="card" id="entry-photos"><h2>תמונות${photos.length ? ` (${photos.length})` : ''}</h2>${photos.length ? `${photosHtml(photos)}<p class="note">נגיעה בתמונה פותחת אותה בגדול. שם אפשר גם למחוק אותה.</p>` : (e.photosDeletedAt ? `<p class="muted">התמונות של ההקלטה נמחקו ב-${fmtWhen(e.photosDeletedAt)}, במחיקת נתונים.</p>` : '<p class="muted">אין תמונות להקלטה הזו.</p>')}${photoButtons(e.dayKey, e.id)}</section>`;
     return `<main class="scr with-nav">${wave('tr')}
       <header class="head"><button class="icon-btn" data-act="back" aria-label="חזרה">${icon('back')}</button>
         <p class="eyebrow" style="flex:1">${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${entryDur(e)}${e.via === 'quick' ? ' · הקלטה מהירה' : ''}${e.recovered ? ' · שוחזרה' : ''}${e.audioDeletedAt && !a ? ' · הקול נמחק' : ''}</p></header>
+      ${photos.length ? photoCard : ''}
       <div><div class="tabs"><button data-act="entry-tab" data-tab="raw" class="${on(ui.entryTab === 'raw')}">מה שאמרתי</button><button data-act="entry-tab" data-tab="tidy" class="${on(ui.entryTab === 'tidy')}">מסודר לפרסום</button></div>
       <div class="folder">${confirmBox('regen', 'הגרסה המסודרת נערכה ידנית. סידור מחדש ידרוס את העריכה (אפשר לבטל אחר כך).', 'regen-yes', 'סדר מחדש')}${body}</div></div>
       ${audio ? `<section class="card audio-box"><h2>הקול</h2>${audio}</section>` : ''}
-      <section class="card"><h2>תמונות</h2>${photos.length ? `<div class="photos">${photosHtml(photos, true)}</div>` : (e.photosDeletedAt ? `<p class="muted">התמונות של ההקלטה נמחקו ב-${fmtWhen(e.photosDeletedAt)}, במחיקת נתונים.</p>` : '<p class="muted">אין תמונות להקלטה הזו.</p>')}${photoButtons(e.dayKey, e.id)}</section>
+      ${photos.length ? '' : photoCard}
       ${confirmBox('del-entry', 'למחוק את ההקלטה, את הגרסה המסודרת, את הקול ואת התמונות שלה? אי אפשר לבטל.', 'del-entry-yes', 'מחק')}
       <button class="link" style="color:var(--danger)" data-act="del-entry">מחק את ההקלטה</button>
     </main>${ui.word ? wordPop(e) : ''}${nav()}`;
@@ -549,6 +643,18 @@ const SCREENS = {
 
   library() {
     const raw = ui.libTab === 'raw';
+    const tabs = `<div class="tabs three"><button data-act="lib-tab" data-tab="raw" class="${on(ui.libTab === 'raw')}">מה שאמרתי</button><button data-act="lib-tab" data-tab="tidy" class="${on(ui.libTab === 'tidy')}">מסודר לפרסום</button><button data-act="lib-tab" data-tab="photos" class="${on(ui.libTab === 'photos')}">התמונות שלי</button></div>`;
+    if (ui.libTab === 'photos') {
+      // 1.6.5 "התמונות שלי": every photo in one place, newest first, whatever recording or day it belongs to.
+      const all = allPhotosNewestFirst();
+      const cap = (p) => { const o = photoOwner(p); return `<span class="cap-d">${S.short(p.dayKey)}</span><span class="cap-t">${o ? esc(entryTitle(o)) : 'תמונת יום'}</span>`; };
+      return `<main class="scr with-nav">${wave('tr')}
+      <header class="head"><h1>ספריות</h1></header>
+      <div>${tabs}<div class="folder" id="my-photos">${all.length
+        ? `<p class="note">${all.length === 1 ? 'תמונה אחת' : `${all.length} תמונות`}, מהחדשה לישנה. נגיעה בתמונה פותחת אותה בגדול, ושם אפשר גם למחוק אותה.</p>${photosHtml(all, { caption: cap })}`
+        : '<p class="muted">עוד אין תמונות. מוסיפים תמונה במסך "היום" (צלם או מהגלריה), או בתוך הקלטה.</p>'}</div></div>
+    </main>${nav()}`;
+    }
     let last = '';
     const items = entriesSorted().map((e) => {
       const m = S.monthKey(e.dayKey);
@@ -559,12 +665,12 @@ const SCREENS = {
         : tidyGone(e) ? `<span class="t"><b>${esc(entryTitle(e))}</b> <span class="muted">(הגרסה המסודרת נמחקה)</span></span>`
         : `<span class="t"><b>${esc(e.tidy.title)}</b> ${esc(S.firstSentences(e.tidy.paragraphs.join(' '), 1))}</span>`;
       return `${h}<div class="item"><button class="item-main" data-act="open-entry" data-id="${e.id}" data-tab="${raw ? 'raw' : 'tidy'}">
-        <span class="d"><span>${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span>${preview}</button>
+        <span class="d"><span>${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span>${preview}${entryPhotoBadge(e)}</button>
         <button class="other" data-act="open-entry" data-id="${e.id}" data-tab="${raw ? 'tidy' : 'raw'}">${raw ? 'לגרסה המסודרת ←' : 'למה שאמרתי ←'}</button></div>`;
     }).join('');
     return `<main class="scr with-nav">${wave('tr')}
       <header class="head"><h1>ספריות</h1></header>
-      <div><div class="tabs"><button data-act="lib-tab" data-tab="raw" class="${on(raw)}">מה שאמרתי</button><button data-act="lib-tab" data-tab="tidy" class="${on(!raw)}">מסודר לפרסום</button></div>
+      <div>${tabs}
       <div class="folder"><div class="list">${items || '<p class="muted">עוד אין הקלטות. הכפתור הירוק למטה מתחיל הקלטה.</p>'}</div></div></div>
     </main>${nav()}`;
   },
@@ -612,7 +718,7 @@ const SCREENS = {
         <button class="icon-btn" data-act="sum-nav" data-dir="1" aria-label="התקופה הבאה" ${canNext ? '' : 'disabled style="opacity:.3"'}>${icon('next')}</button></div>
       ${digestBtn}
       <section class="card">${dots}${body}</section>
-      ${photos.length ? `<section class="card"><h2>תמונות</h2><div class="photos">${photosHtml(photos, false)}</div></section>` : ''}
+      ${photos.length ? `<section class="card"><h2>תמונות</h2>${photosHtml(photos)}</section>` : ''}
       <div class="row"><button class="btn honey" style="flex:1" data-act="share-sum" ${text ? '' : 'disabled'}>${icon('share')}שלח</button>
         <button class="round" data-act="tts-play" data-src="sum" aria-label="השמע" ${text ? '' : 'disabled'}>${icon('speaker')}</button>
         <button class="round" data-act="copy-sum" aria-label="העתק" ${text ? '' : 'disabled'}>${icon('copy')}</button>
@@ -1368,15 +1474,32 @@ for (const [id, source] of [['pick-camera', 'camera'], ['pick-gallery', 'gallery
     ui.external = false;
     if (!files.length || !target || !V.isUnlocked()) return;
     let ok = 0, noLoc = 0;
+    const saved = [];
     toast('שומר תמונה…');
     for (const f of files) {
-      try { const p = await processPhoto(f, source, target); ok++; if (p.lat == null) noLoc++; }
+      try { const p = await processPhoto(f, source, target); ok++; saved.push(p.id); if (p.lat == null) noLoc++; }
       catch (e) { toast(e.code === 'decode' ? 'לא הצלחתי לפתוח את התמונה. אולי הפורמט לא נתמך (למשל HEIC).' : 'שמירת התמונה נכשלה.'); }
     }
-    const tip = noLoc && source === 'gallery' && P.isIOS ? ' באייפון: בבחירת תמונה לחץ "אפשרויות" למעלה והפעל "מיקום".' : '';
-    if (ok) toast((ok === 1 ? (noLoc ? 'התמונה נשמרה, בלי מיקום.' : 'התמונה נשמרה עם מיקום.') : `נשמרו ${ok} תמונות${noLoc ? `, ל-${noLoc} מהן אין מיקום` : ''}.`) + tip, tip ? 9000 : 4500);
+    if (!ok) return;
+    toast(photoSavedText(ok, noLoc, source, target), 9000);
+    // Show the new photo: marked for a few seconds and scrolled into view on the screen that is open.
+    ui.newPhotos = new Set(saved);
     render();
+    const el = app.querySelector('.ph.new');
+    if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    setTimeout(() => { ui.newPhotos = null; app.querySelectorAll('.ph.new').forEach((x) => x.classList.remove('new')); }, 6000);
   });
+}
+// "התמונה נשמרה, אפשר לראות אותה ב…": the place it really appears, plus whether it has a location.
+function photoSavedText(ok, noLoc, source, target) {
+  const one = ok === 1;
+  const here = target.entryId ? 'ב"תמונות" של ההקלטה הזו (למעלה)'
+    : target.dayKey === today() ? 'במסך "היום", ב"תמונות של היום"' : `בתמונות של ${S.short(target.dayKey)}`;
+  const head = one ? `התמונה נשמרה, אפשר לראות אותה ${here}` : `נשמרו ${ok} תמונות, אפשר לראות אותן ${here}`;
+  const lib = ' וגם בספריות, בלשונית "התמונות שלי".';
+  const loc = one ? (noLoc ? ' אין לה מיקום.' : ' המיקום שלה נשמר.') : noLoc ? ` ל-${noLoc} מהן אין מיקום.` : '';
+  const tip = noLoc && source === 'gallery' && P.isIOS ? ' באייפון: בבחירת תמונה לחץ "אפשרויות" למעלה והפעל "מיקום".' : '';
+  return head + lib + loc + tip;
 }
 
 // ---------------------------------------------------------------- share / copy / file
@@ -1700,17 +1823,16 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
     inp.value = '';
     inp.click();
   },
-  'photo-view': (el) => { ui.viewPhoto = el.dataset.id; render(); },
-  'viewer-close': () => { ui.viewPhoto = null; render(); },
-  'photo-del': async (el) => {
-    const id = el.dataset.id;
-    if (ui.confirm !== 'photo:' + id) { ui.confirm = 'photo:' + id; render(); return; }
-    const p = vault.photos.get(id);
-    if (p && p.entryId) { const e = vault.entries.get(p.entryId); if (e) { e.photoIds = (e.photoIds || []).filter((x) => x !== id); await V.saveEntry(e); } }
-    await V.deletePhoto(id);
-    ui.confirm = null;
-    render();
+  'photo-view': (el) => {
+    const box = el.closest('[data-ids]');
+    const ids = box && box.dataset.ids ? box.dataset.ids.split(',') : [el.dataset.id];
+    openViewer(ids, ids.indexOf(el.dataset.id));
   },
+  'viewer-close': () => closeViewer(),
+  'vw-step': (el) => { viewerStep(+el.dataset.dir); },
+  'vw-del': () => { if (!ui.viewer) return; ui.viewer.ask = true; renderViewer(); },
+  'vw-del-no': () => { if (!ui.viewer) return; ui.viewer.ask = false; renderViewer(); },
+  'vw-del-yes': (el) => deleteViewedPhoto(el),
   'open-sum': (el) => go('summaries', { sumKind: el.dataset.kind, sumKey: el.dataset.key }),
   'sum-kind': (el) => { ui.sumKind = el.dataset.kind; ui.sumKey = defaultKey(ui.sumKind); Object.assign(ui, TRANSIENT); render(); },
   'sum-nav': (el) => {
@@ -2021,6 +2143,12 @@ app.addEventListener('change', (ev) => {
   const fn = CHANGES[ev.target.dataset.change];
   if (fn) fn(ev.target);
 });
+document.addEventListener('keydown', (ev) => {
+  if (!ui.viewer) return;
+  if (ev.key === 'Escape') { ev.preventDefault(); if (ui.viewer.ask) { ui.viewer.ask = false; renderViewer(); } else closeViewer(); }
+  else if (ev.key === 'ArrowLeft') { ev.preventDefault(); viewerStep(1); } // right to left: the next photo is on the left
+  else if (ev.key === 'ArrowRight') { ev.preventDefault(); viewerStep(-1); }
+});
 app.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && ev.target.id === 'word-input') { ev.preventDefault(); wordOp(ui.word && ui.word.mode === 'add' ? 'add' : 'replace'); }
   if (ev.key === 'Escape' && ui.word) { ui.word = null; render(); }
@@ -2056,5 +2184,5 @@ async function boot() {
   go(ui.hasVault ? 'lock' : 'setup', {}, 'replace');
   announceUpdate();
 }
-if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake, updater, renderUpdateBar, VERSION, announceUpdate, UPD_KEY, WP, summaryText };
+if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake, updater, renderUpdateBar, VERSION, announceUpdate, UPD_KEY, WP, summaryText, photoSavedText, viewerStep };
 boot();
