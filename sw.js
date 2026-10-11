@@ -1,6 +1,6 @@
 // Offline shell for היומן. Caches only the app's own files. User data never passes through here
 // (it lives in IndexedDB, encrypted). Bump CACHE on every deploy so phones pick up the new version.
-const CACHE = 'yoman-v1.6.2';
+const CACHE = 'yoman-v1.6.3';
 const VERSION = CACHE.slice('yoman-v'.length);
 const ASSETS = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
@@ -9,7 +9,8 @@ const ASSETS = [
   'fonts/varela-hebrew-400.woff2', 'fonts/varela-latin-400.woff2',
   'js/app.js', 'js/crypto.js', 'js/db.js', 'js/digest.js', 'js/exif.js', 'js/koru.js', 'js/platform.js', 'js/speech.js',
   'js/summaries.js', 'js/tidy.js', 'js/updater.js', 'js/vault.js', 'js/voice.js', 'js/wake.js', 'js/webauthn.js',
-  'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
+  // Icons are referenced with ?v=1.6.3; the fetch handler matches with ignoreSearch, so these entries serve them.
+  'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-32.png',
 ];
 // From 1.6.1 on, a new version waits until the owner taps "עדכן עכשיו" (the page sends SKIP_WAITING).
 const FIRST_WAITING_VERSION = '1.6.1';

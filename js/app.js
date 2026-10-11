@@ -14,7 +14,7 @@ import { WakeKeeper } from './wake.js';
 import { digestDay, browserSummarizer } from './digest.js';
 import { Updater } from './updater.js';
 
-const VERSION = '1.6.2';
+const VERSION = '1.6.3';
 const JOURNAL_TEXT_MS = 8000;   // how often the transcript of a running recording is written to the crash-safe journal
 const wake = new WakeKeeper({ log: (ev, d) => V.log(ev, d) });
 const WORD_PAGE = 1500;        // word buttons rendered at once in the raw view (100K-character entries stay fast)
@@ -311,7 +311,7 @@ const SCREENS = {
   boot: () => '<main class="scr boot"><p class="muted">טוען…</p></main>',
 
   setup: () => `<main class="scr">${wave('big')}
-  <div class="card" style="margin-top:150px"><h1 class="brand">היומן</h1><p class="owner">של חגי דביר</p><p>מדברים, והיומן כותב. מה שנכתב נשמר בטלפון הזה בלבד.</p></div>
+  <div class="card" style="margin-top:150px"><h1 class="brand">סיפורי חגי</h1><p>מדברים, והיומן כותב. מה שנכתב נשמר בטלפון הזה בלבד.</p></div>
   <section class="card disclose"><h2>לפני שמתחילים</h2><ul>
     <li><b>התמלול עובר דרך ${P.speechVendor}.</b> בזמן הקלטה, הדפדפן שולח את הקול לשרתי ${P.speechVendor} כדי להפוך אותו לטקסט. כרגע זו הדרך היחידה לתמלל עברית בטלפון בזמן אמת.</li>
     ${P.isIOS ? `<li><b>באייפון צריך להתקין את היומן במסך הבית.</b> אחרת Safari עלול למחוק אותו אם לא תפתח אותו שבוע. ההסבר יופיע אחרי שתיצור את היומן.</li>` : ''}
@@ -342,8 +342,7 @@ const SCREENS = {
 
   lock: () => `<main class="scr">${wave('big')}${HILLS}<div class="lockwrap">
   <form class="card" data-form="unlock" novalidate>
-    <h1 class="brand">היומן</h1>
-    <p class="owner">של חגי דביר</p>
+    <h1 class="brand">סיפורי חגי</h1>
     <p class="muted">${S.longDate(today())} · נעול</p>
     <label class="field">סיסמה<input type="password" id="pw" autocomplete="current-password"></label>
     <p class="err" hidden></p>
@@ -648,11 +647,11 @@ const SCREENS = {
           <li>לחץ על + למעלה.</li>
           <li>לחץ "הוסף פעולה", חפש "פתח כתובות URL" ובחר בה.</li>
           <li>לחץ על "URL" והדבק את הכתובת שהעתקת.</li>
-          <li>לחץ על שם הקיצור למעלה, ושנה אותו ל"יומן".</li>
-          <li>מעכשיו אמור: "היי סירי, יומן".</li></ol>
+          <li>לחץ על שם הקיצור למעלה, ושנה אותו ל"סיפורי חגי".</li>
+          <li>מעכשיו אמור: "היי סירי, תפתחי סיפורי חגי" (או בקצרה: "היי סירי, סיפורי חגי").</li></ol>
           <p class="notice">הקיצור פותח את היומן ב-Safari, לא ביומן שמותקן במסך הבית. אפל לא מאפשרת לקיצור לפתוח אפליקציה של מסך הבית. היומן ב-Safari והיומן המותקן שומרים נתונים בנפרד, ולכן כדי להשתמש ב-Siri צריך לנהל את היומן ב-Safari.</p>
           <p class="note">אם האייפון נעול, Siri תבקש קודם לפתוח אותו. ייתכן גם ש-Safari ידרוש נגיעה אחת כדי להתחיל להקליט. אז יופיע מסך שכולו כפתור.</p>`
-        : `<h3>באנדרואיד</h3><ol class="steps"><li>אם היומן מותקן, לחיצה ארוכה על האייקון מציגה "הקלטה מהירה".</li><li>אפשר גם לומר "Hey Google, פתח את היומן" ולגעת בכפתור הגדול.</li></ol>`}
+        : `<h3>באנדרואיד</h3><ol class="steps"><li>אם היומן מותקן, לחיצה ארוכה על האייקון מציגה "הקלטה מהירה".</li><li>אפשר גם לומר "Hey Google, פתח את סיפורי חגי" ולגעת בכפתור הגדול.</li></ol>`}
       </details>
       <details class="card"><summary>השמעה בקול</summary>
         <p>הכפתור "השמע" מקריא את הגרסה המסודרת ואת הסיכומים בקול עברי של הטלפון. כשדיבורית או אוזניות מחוברות, הקול יוצא דרכן.</p>
