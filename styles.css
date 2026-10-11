@@ -279,3 +279,20 @@ textarea.grow { min-height: 40dvh; overflow: hidden; resize: none; }
 form.fs { position: fixed; z-index: 45; inset-inline: 0; top: var(--vvtop, 0px); height: var(--vvh, 100dvh); margin: 0; padding: calc(env(safe-area-inset-top, 0px) + 10px) 12px 10px; background: var(--paper); display: flex !important; flex-direction: column; gap: 8px; }
 form.fs label.field { flex: 1; min-height: 0; }
 form.fs textarea { flex: 1; min-height: 0 !important; height: auto !important; overflow: auto !important; }
+/* 1.6.4 data deletion */
+.btn.red { background: var(--danger); color: #fff; box-shadow: 0 3px 0 #6B2410; }
+.btn.red:active { box-shadow: 0 1px 0 #6B2410; }
+.wipe-type { padding: 6px 0; border-bottom: 2px dotted var(--line); }
+.wipe-type:last-of-type { border-bottom: 0; }
+.wipe-type.off { opacity: .55; }
+.wipe-dates label.field { flex: 1 1 140px; }
+.wipe-dates input[type=date] { direction: rtl; }
+.wipe-picks { max-height: 55vh; overflow: auto; gap: 2px; }
+.wipe-pick { padding: 8px 0; border-bottom: 2px dotted var(--line); }
+.wipe-pick b { font-family: var(--f-display); font-weight: 400; color: var(--dgreen); }
+.wipe-list { margin: 0; padding-inline-start: 20px; display: flex; flex-direction: column; gap: 6px; font-size: 16px; }
+.wipe-list.deps, .wipe-list.fx { font-size: 15px; color: var(--muted); }
+.wipe-total { margin: 0; font-size: 17px; }
+.wipe-freed { font-size: 20px; margin: 0; }
+.wipe-final { border: 2px solid var(--danger); }
+.danger-zone summary { color: var(--danger); }

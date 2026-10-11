@@ -55,6 +55,18 @@ export async function getLog() {
   await logQueue;
   return ((await db.get('meta', 'log')) || { items: [] }).items;
 }
+// Removes the log lines for which drop(item) is true. Queued with the writes, so no line is lost or resurrected.
+export function pruneLog(drop) {
+  let removed = 0;
+  logQueue = logQueue.then(async () => {
+    const l = await db.get('meta', 'log');
+    if (!l) return;
+    const keep = l.items.filter((it) => !drop(it));
+    removed = l.items.length - keep.length;
+    if (keep.length) await db.put('meta', { ...l, items: keep }); else await db.del('meta', 'log');
+  });
+  return logQueue.then(() => removed);
+}
 
 // ---------- vault lifecycle ----------
 export async function hasVault() {
@@ -95,6 +107,25 @@ export async function enrollPrf({ credId, prfSalt, prf, path, enabledFlag }) {
   await db.put('meta', { id: 'prf', credId, prfSalt, hkdfSalt, wrapped, path, enabledFlag, created: Date.now() });
 }
 export const removePrf = () => db.del('meta', 'prf');
+
+// Confirmation for destructive actions (data deletion): true only if the password / PRF output really opens the vault.
+// Nothing is stored or changed.
+export async function verifyPassword(password) {
+  const m = await db.get('meta', 'vault');
+  if (!m || typeof password !== 'string' || !password) return false;
+  try { await C.unwrapDek(m.wrapped, await C.kekFromPassword(password, m.salt, m.iter)); return true; } catch (e) { return false; }
+}
+export async function verifyPrf(prf) {
+  const p = await db.get('meta', 'prf');
+  if (!p || !prf) return false;
+  try { await C.unwrapDek(p.wrapped, await C.kekFromPrf(prf, p.hkdfSalt)); return true; } catch (e) { return false; }
+}
+// auth: { password } or { prf }. Throws 'not-confirmed' (nothing given) or 'bad-password' (wrong).
+export async function requireAuth(auth) {
+  if (!auth || (!auth.password && !auth.prf)) throw Object.assign(new Error('not-confirmed'), { code: 'not-confirmed' });
+  const okd = auth.prf ? await verifyPrf(auth.prf) : await verifyPassword(auth.password);
+  if (!okd) throw Object.assign(new Error('bad-password'), { code: 'bad-password' });
+}
 
 export async function changePassword(oldPw, newPw) {
   const m = await db.get('meta', 'vault');
@@ -251,6 +282,7 @@ export function lock() {
   vault.entries.clear(); vault.photos.clear(); vault.summaries.clear(); vault.audio.clear();
   for (const u of vault.urls.values()) URL.revokeObjectURL(u);
   vault.urls.clear();
+  sizeCache.clear();
 }
 
 // ---------- records ----------
@@ -303,9 +335,24 @@ export async function savePhoto(meta, fullBlob, thumbBlob) {
 }
 export async function deletePhoto(id) {
   const p = vault.photos.get(id);
-  if (p) { await db.del('blobs', p.blobId); await db.del('blobs', p.thumbId); }
+  if (p) { await db.del('blobs', p.blobId); await db.del('blobs', p.thumbId); dropUrl(p.blobId); dropUrl(p.thumbId); }
   vault.photos.delete(id);
   await db.del('photos', id);
+}
+// Rewrite a photo's (encrypted) details, e.g. after its location was removed.
+export async function savePhotoMeta(p) { vault.photos.set(p.id, p); await putEnc('photos', p); }
+function dropUrl(blobId) {
+  const u = vault.urls.get(blobId);
+  if (u) { URL.revokeObjectURL(u); vault.urls.delete(blobId); }
+}
+// Bytes a stored blob takes (ciphertext + IV). Cached per unlock: photos never change after they are saved.
+const sizeCache = new Map();
+export async function blobSize(id) {
+  if (sizeCache.has(id)) return sizeCache.get(id);
+  const r = await db.get('blobs', id);
+  const n = r && r.enc ? r.enc.ct.byteLength + r.enc.iv.byteLength : 0;
+  sizeCache.set(id, n);
+  return n;
 }
 
 // ---------- audio (kept 30 days unless "keep forever") ----------
@@ -328,6 +375,7 @@ export async function setAudioKeep(id, keep) {
 }
 export async function deleteAudio(id) {
   await db.del('blobs', 'audio-' + id);
+  dropUrl('audio-' + id);
   await db.del('audio', id);
   vault.audio.delete(id);
 }
@@ -389,6 +437,7 @@ export async function importBackup(payload, mode = 'merge') {
     for (const s of ['entries', 'photos', 'blobs', 'audio', 'summaries']) await db.clear(s);
     for (const u of vault.urls.values()) URL.revokeObjectURL(u);
     vault.urls.clear();
+    sizeCache.clear();
   }
   for (const e of payload.entries || []) await putEnc('entries', e);
   for (const p of payload.photos || []) await putEnc('photos', p);
@@ -411,6 +460,15 @@ export async function storageInfo() {
 }
 export async function requestPersist() {
   try { return navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : null; } catch (e) { return null; }
+}
+
+// "מחק את הכול ואפס את היומן": every store, including the password wrapping, settings and the biometric
+// wrapping. Only after the password (or PRF) is confirmed. Afterwards the app starts at the setup screen.
+export async function resetAll(auth) {
+  await requireAuth(auth);
+  lock();
+  await logQueue;
+  await db.clearAll();
 }
 
 // ---------- writing draft (encrypted, autosaved while typing) ----------

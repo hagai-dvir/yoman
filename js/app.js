@@ -13,8 +13,9 @@ import * as VO from './voice.js';
 import { WakeKeeper } from './wake.js';
 import { digestDay, browserSummarizer } from './digest.js';
 import { Updater } from './updater.js';
+import * as WP from './wipe.js';
 
-const VERSION = '1.6.3';
+const VERSION = '1.6.4';
 const JOURNAL_TEXT_MS = 8000;   // how often the transcript of a running recording is written to the crash-safe journal
 const wake = new WakeKeeper({ log: (ev, d) => V.log(ev, d) });
 const WORD_PAGE = 1500;        // word buttons rendered at once in the raw view (100K-character entries stay fast)
@@ -32,6 +33,21 @@ function grow(ta) { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight 
 const tidyFor = (e) => (e.input === 'written' ? tidyWritten(e.segments) : tidy(e.segments));
 const fmtDur = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} דק׳`;
 const today = () => S.dayKey(Date.now());
+// 1.6.4: a recording may have lost its raw text or its tidy version in "מחיקת נתונים".
+const hasRaw = (e) => !!(e.segments && e.segments.length);
+const tidyGone = (e) => !!(e.tidy && e.tidy.deleted);
+function entryTitle(e) {
+  if (e.tidy && e.tidy.title) return e.tidy.title;
+  if (hasRaw(e)) return tidyFor(e).title || 'ללא כותרת';
+  return 'הקלטה בלי טקסט';
+}
+// The tidy text summaries are built from: the stored one, or (if it was deleted) one made from the raw text now.
+const sumTidy = (e) => (!tidyGone(e) ? e.tidy : hasRaw(e) ? tidyFor(e) : null);
+const forSummary = (es) => es.map((e) => { const t = sumTidy(e); return t === e.tidy ? e : t ? { ...e, tidy: t } : null; }).filter(Boolean);
+const fmtBytes = (b) => (b < 1024 ? 'פחות מ-1 ק"ב' : b < 1048576 ? `${Math.round(b / 1024)} ק"ב` : `${(b / 1048576).toFixed(1)} מ"ב`);
+const fmtDay = (k) => { const d = S.parseDay(k); return `${d.getDate()}.${d.getMonth() + 1}.${d.getFullYear()}`; };
+const fmtSpan = (f, t) => (f === t ? `ב-${fmtDay(f)}` : `מ-${fmtDay(f)} עד ${fmtDay(t)}`);
+const fmtWhen = (ms) => fmtDay(S.dayKey(ms));
 
 const ui = {
   screen: 'boot', lastScreen: null,
@@ -92,7 +108,7 @@ function render() {
 // ---------------------------------------------------------------- version updates
 // Busy = something unsaved could be lost by a reload: a recording, dictation, the writing screen, an open edit form,
 // or a share sheet / picker in progress. The update bar waits until none of these is true.
-const updateBusy = () => !!(ui.rec || ui.dict || ui.external || ui.sumEdit || ui.freeEdit || ui.tidyEdit || ui.word
+const updateBusy = () => !!(ui.rec || ui.dict || ui.external || ui.wiping || ui.sumEdit || ui.freeEdit || ui.tidyEdit || ui.word
   || ['record', 'dictate', 'tapstart', 'write', 'boot'].includes(ui.screen));
 const updater = new Updater({ current: VERSION, isBusy: updateBusy, onChange: () => renderUpdateBar(), log: (ev, d) => V.log(ev, d) });
 function renderUpdateBar() {
@@ -214,7 +230,7 @@ const periodLabel = (kind, key) => kind === 'day' ? S.longDate(key) : kind === '
 function summaryText(kind, key) {
   const st = vault.summaries.get(S.summaryId(kind, key));
   if (st && (st.edited || st.digest)) return st.text;
-  if (kind === 'day') return S.buildDaily(entriesOfDays([key]));
+  if (kind === 'day') return S.buildDaily(forSummary(entriesOfDays([key])));
   if (kind === 'week') return S.buildWeekly(key, (k) => summaryText('day', k));
   return S.buildMonthly(key, (k) => summaryText('day', k));
 }
@@ -223,7 +239,9 @@ function summaryText(kind, key) {
 // Uses the tidy text (fillers and repeats already removed); a tidy version the owner edited is his own words too.
 function digestFor(key) {
   const es = entriesOfDays([key]);
-  const items = es.map((e) => ({ id: e.id, createdAt: e.createdAt, input: e.input, paragraphs: (e.tidy && e.tidy.edited ? e.tidy : tidyFor(e)).paragraphs }));
+  const pick = (e) => (!tidyGone(e) && (e.tidy.edited || !hasRaw(e)) ? e.tidy : hasRaw(e) ? tidyFor(e) : null);
+  const items = es.map((e) => ({ e, t: pick(e) })).filter((x) => x.t)
+    .map(({ e, t }) => ({ id: e.id, createdAt: e.createdAt, input: e.input, paragraphs: t.paragraphs }));
   return digestDay(items);
 }
 async function saveDigest(key, d) {
@@ -299,7 +317,7 @@ function viewer() {
   const p = vault.photos.get(ui.viewPhoto);
   if (!p) return '';
   const when = p.takenAt ? `${S.short(S.dayKey(p.takenAt))} · ${S.timeOf(p.takenAt)}` : S.short(p.dayKey);
-  const src = { gps: 'מיקום מהטלפון בזמן הצילום', exif: 'מיקום מתוך נתוני התמונה' }[p.locSource] || 'לתמונה הזו אין מיקום';
+  const src = { gps: 'מיקום מהטלפון בזמן הצילום', exif: 'מיקום מתוך נתוני התמונה' }[p.locSource] || (p.locDeletedAt ? 'המיקום של התמונה נמחק' : 'לתמונה הזו אין מיקום');
   return `<div class="viewer" role="dialog" aria-label="תמונה">
     <img data-blob="${p.blobId}" alt="תמונה">
     <div class="row split"><span>${esc(when)} · ${src}</span>${p.lat != null ? `<a href="${mapsUrl(p.lat, p.lng)}" target="_blank" rel="noopener noreferrer">${icon('pin')}פתח בגוגל מפות</a>` : ''}</div>
@@ -383,7 +401,7 @@ const SCREENS = {
     ${backupNudge()}
     <section class="card"><h2>ההקלטות של היום</h2>
       ${es.length ? `<div class="list">${es.map((e) => `<div class="item"><button class="item-main" data-act="open-entry" data-id="${e.id}" data-tab="tidy">
-        <span class="d"><span>${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span><span class="t"><b>${esc(e.tidy.title)}</b></span></button></div>`).join('')}</div>` : '<p class="muted">עוד לא הקלטת היום.</p>'}
+        <span class="d"><span>${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span><span class="t"><b>${esc(entryTitle(e))}</b></span></button></div>`).join('')}</div>` : '<p class="muted">עוד לא הקלטת היום.</p>'}
     </section>
     <section class="card"><h2>תמונות של היום</h2>
       ${ps.length ? `<div class="photos">${photosHtml(ps, false)}</div>` : '<p class="muted">אין עדיין תמונות.</p>'}
@@ -437,7 +455,7 @@ const SCREENS = {
     return `<main class="write-scr">
       <header class="write-bar">
         <button class="chip" data-act="write-cancel">סגור</button>
-        <div class="write-mid"><b>${target ? 'הוספה ל: ' + esc(target.tidy.title) : 'כתיבה חדשה'}</b><span id="write-state" class="note">${ui.writeRestored ? 'טיוטה קודמת נפתחה' : 'נשמר אוטומטית, מוצפן'}</span></div>
+        <div class="write-mid"><b>${target ? 'הוספה ל: ' + esc(entryTitle(target)) : 'כתיבה חדשה'}</b><span id="write-state" class="note">${ui.writeRestored ? 'טיוטה קודמת נפתחה' : 'נשמר אוטומטית, מוצפן'}</span></div>
         <button class="btn" data-act="write-save">שמור</button>
       </header>
       <textarea id="write-ta" class="write-ta" lang="he" dir="rtl" placeholder="כתוב כאן. אין הגבלת אורך." autocomplete="off">${esc(ui.writeText || '')}</textarea>
@@ -452,7 +470,13 @@ const SCREENS = {
     const stack = ui.undo.get(e.id) || [];
     const undoBtn = `<button class="chip" data-act="undo" ${stack.length ? '' : 'disabled'}>${icon('undo')}בטל</button>`;
     let body;
-    if (ui.entryTab === 'raw') {
+    if (ui.entryTab === 'raw' && !hasRaw(e) && e.rawDeletedAt) {
+      body = `<p class="notice">התמלול הגולמי של ההקלטה הזו נמחק ב-${fmtWhen(e.rawDeletedAt)}, במחיקת נתונים.${tidyGone(e) ? '' : ' הגרסה המסודרת נשמרה.'}</p>
+        <div class="row"><button class="chip" data-act="write-append">${icon('pencil')}הוסף כתיבה</button></div>`;
+    } else if (ui.entryTab === 'tidy' && tidyGone(e)) {
+      body = `<p class="notice">הגרסה המסודרת של ההקלטה הזו נמחקה${e.tidy.deletedAt ? ` ב-${fmtWhen(e.tidy.deletedAt)}` : ''}, במחיקת נתונים.${hasRaw(e) ? ' מה שאמרת נשמר, ואפשר לסדר אותו מחדש.' : ''}</p>
+        ${hasRaw(e) ? `<div class="row"><button class="chip" data-act="regen">${icon('sparkle')}סדר מחדש מהגולמי</button></div>` : ''}`;
+    } else if (ui.entryTab === 'raw') {
       const tools = `<div class="row">${undoBtn}<button class="chip ${on(ui.freeEdit)}" data-act="free-edit">${icon('text')}עריכה חופשית</button><button class="chip" data-act="write-append">${icon('pencil')}הוסף כתיבה</button>${stale ? `<button class="chip hot" data-act="regen">${icon('sparkle')}סדר מחדש</button>` : ''}</div>`;
       if (ui.freeEdit) {
         body = `${tools}<form data-form="free-edit" class="col" style="display:flex;flex-direction:column;gap:10px">
@@ -498,7 +522,8 @@ const SCREENS = {
     if (a) {
       audio = `<audio controls preload="none" data-audio="${a.id}" data-mime="${esc(e.audioMime || '')}"></audio>
         <label class="switch"><span>שמור את הקול לתמיד${a.keep ? '' : `<br><span class="note">אחרת יימחק ב-${S.short(S.dayKey(V.audioExpiry(a)))}</span>`}</span><input type="checkbox" data-change="audio-keep" data-id="${a.id}" ${a.keep ? 'checked' : ''}></label>`;
-    } else if (e.audioId) audio = '<p class="muted">הקול של ההקלטה נמחק אחרי 30 יום. הטקסט נשאר.</p>';
+    } else if (e.audioDeletedAt) audio = `<p class="muted">הקול נמחק: הקול של ההקלטה נמחק ב-${fmtWhen(e.audioDeletedAt)}, במחיקת נתונים. ${hasRaw(e) || !tidyGone(e) ? 'הטקסט נשאר.' : ''}</p>`;
+    else if (e.audioId) audio = '<p class="muted">הקול של ההקלטה נמחק אחרי 30 יום. הטקסט נשאר.</p>';
     const more = (e.audioMore || []).map((m) => vault.audio.get(m.id) ? { ...m, a: vault.audio.get(m.id) } : null).filter(Boolean);
     if (more.length) {
       audio += `<p class="note">ההקלטה נשמרה בכמה חלקים, כי המיקרופון נעצר כשהיומן היה ברקע.</p>`
@@ -512,11 +537,11 @@ const SCREENS = {
     const photos = (e.photoIds || []).map((id) => vault.photos.get(id)).filter(Boolean);
     return `<main class="scr with-nav">${wave('tr')}
       <header class="head"><button class="icon-btn" data-act="back" aria-label="חזרה">${icon('back')}</button>
-        <p class="eyebrow" style="flex:1">${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${entryDur(e)}${e.via === 'quick' ? ' · הקלטה מהירה' : ''}${e.recovered ? ' · שוחזרה' : ''}</p></header>
+        <p class="eyebrow" style="flex:1">${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${entryDur(e)}${e.via === 'quick' ? ' · הקלטה מהירה' : ''}${e.recovered ? ' · שוחזרה' : ''}${e.audioDeletedAt && !a ? ' · הקול נמחק' : ''}</p></header>
       <div><div class="tabs"><button data-act="entry-tab" data-tab="raw" class="${on(ui.entryTab === 'raw')}">מה שאמרתי</button><button data-act="entry-tab" data-tab="tidy" class="${on(ui.entryTab === 'tidy')}">מסודר לפרסום</button></div>
       <div class="folder">${confirmBox('regen', 'הגרסה המסודרת נערכה ידנית. סידור מחדש ידרוס את העריכה (אפשר לבטל אחר כך).', 'regen-yes', 'סדר מחדש')}${body}</div></div>
       ${audio ? `<section class="card audio-box"><h2>הקול</h2>${audio}</section>` : ''}
-      <section class="card"><h2>תמונות</h2>${photos.length ? `<div class="photos">${photosHtml(photos, true)}</div>` : '<p class="muted">אין תמונות להקלטה הזו.</p>'}${photoButtons(e.dayKey, e.id)}</section>
+      <section class="card"><h2>תמונות</h2>${photos.length ? `<div class="photos">${photosHtml(photos, true)}</div>` : (e.photosDeletedAt ? `<p class="muted">התמונות של ההקלטה נמחקו ב-${fmtWhen(e.photosDeletedAt)}, במחיקת נתונים.</p>` : '<p class="muted">אין תמונות להקלטה הזו.</p>')}${photoButtons(e.dayKey, e.id)}</section>
       ${confirmBox('del-entry', 'למחוק את ההקלטה, את הגרסה המסודרת, את הקול ואת התמונות שלה? אי אפשר לבטל.', 'del-entry-yes', 'מחק')}
       <button class="link" style="color:var(--danger)" data-act="del-entry">מחק את ההקלטה</button>
     </main>${ui.word ? wordPop(e) : ''}${nav()}`;
@@ -530,7 +555,8 @@ const SCREENS = {
       const h = m !== last ? `<h3 class="month-h">${S.monthLabel(m)}</h3>` : '';
       last = m;
       const preview = raw
-        ? `<span class="t hand">${esc(rawText(e.segments).slice(0, 220)) || '…'}</span>`
+        ? (!hasRaw(e) && e.rawDeletedAt ? '<span class="t muted">(התמלול הגולמי נמחק)</span>' : `<span class="t hand">${esc(rawText(e.segments).slice(0, 220)) || '…'}</span>`)
+        : tidyGone(e) ? `<span class="t"><b>${esc(entryTitle(e))}</b> <span class="muted">(הגרסה המסודרת נמחקה)</span></span>`
         : `<span class="t"><b>${esc(e.tidy.title)}</b> ${esc(S.firstSentences(e.tidy.paragraphs.join(' '), 1))}</span>`;
       return `${h}<div class="item"><button class="item-main" data-act="open-entry" data-id="${e.id}" data-tab="${raw ? 'raw' : 'tidy'}">
         <span class="d"><span>${S.longDate(e.dayKey)} · ${S.timeOf(e.createdAt)}</span><span>${entryDur(e)}</span></span>${preview}</button>
@@ -592,6 +618,110 @@ const SCREENS = {
         <button class="round" data-act="copy-sum" aria-label="העתק" ${text ? '' : 'disabled'}>${icon('copy')}</button>
         <button class="round" data-act="file-sum" aria-label="הורד כקובץ טקסט" ${text ? '' : 'disabled'}>${icon('download')}</button></div>
     </main>${nav()}`;
+  },
+
+  // 1.6.4 "מחיקת נתונים": choose → exact summary + backup + password/Face ID → done (how much space was freed).
+  wipe() {
+    const w = ui.wipe;
+    if (!w) { ui.screen = 'settings'; return SCREENS.settings(); }
+    const head = `<header class="head"><button class="icon-btn" data-act="wipe-back" aria-label="חזרה להגדרות">${icon('back')}</button><h1>מחיקת נתונים</h1></header>`;
+    const frame = (inner) => `<main class="scr with-nav wipe">${wave('tr')}${head}${inner}</main>${nav()}`;
+    const recording = !!(ui.rec || ui.dict);
+    const recBlock = recording ? '<p class="notice" role="alert">בזמן הקלטה אי אפשר למחוק נתונים. סיים את ההקלטה, ואז חזור לכאן.</p>' : '';
+    if (w.step === 'done' && w.result) {
+      const r = w.result;
+      const lines = WP.TYPES.filter((ty) => r.done[ty.key]).map((ty) => `<li>${esc(ty.label)}: ${WP.qty(ty.key, r.done[ty.key])}</li>`).join('');
+      const mb = (b) => (b / 1048576).toFixed(1) + ' מ"ב';
+      return frame(`<section class="card wipe-done" role="status"><h2>המחיקה הושלמה</h2>
+        <ul class="wipe-list">${lines || '<li>לא היה מה למחוק.</li>'}</ul>
+        ${r.removedEntries === 1 ? '<p>הקלטה אחת נמחקה לגמרי מהספריות, כי לא נשאר בה כלום.</p>' : r.removedEntries ? `<p>${r.removedEntries} הקלטות נמחקו לגמרי מהספריות, כי לא נשאר בהן כלום.</p>` : ''}
+        <p class="wipe-freed">התפנה מקום: כ-<b>${fmtBytes(r.freed)}</b>.</p>
+        ${r.before != null && r.after != null ? `<p class="note">לפי הדפדפן: לפני המחיקה ${mb(r.before)} בשימוש, עכשיו ${mb(r.after)}. הדפדפן משחרר את המקום בדיסק בהדרגה, ולכן המספר שלו עשוי לרדת רק אחרי זמן מה.</p>` : ''}
+        <button class="btn wide" data-act="wipe-again">מחיקה נוספת</button>
+        <button class="btn ghost wide" data-act="wipe-back">חזרה להגדרות</button></section>`);
+    }
+    if (!w.atoms) return frame(`<section class="card"><p class="muted">${w.scanErr ? esc(w.scanErr) : 'סופר מה שמור בטלפון…'}</p></section>`);
+
+    if (w.step === 'confirm' && w.plan) {
+      const t = WP.tally(w.plan);
+      const fx = WP.effects(w.plan);
+      const total = w.plan.reduce((n, a) => n + a.bytes, 0);
+      const lines = WP.TYPES.filter((ty) => t[ty.key]).map((ty) => { const x = t[ty.key]; return `<li data-type="${ty.key}"><b>${esc(ty.label)}</b>: ${WP.qty(ty.key, x.count)}, ${fmtSpan(x.from, x.to)}, כ-${fmtBytes(x.bytes)}</li>`; }).join('');
+      const fxl = [
+        fx.removed === 1 ? 'הקלטה אחת תימחק לגמרי מהספריות, כי לא יישאר בה כלום.' : fx.removed ? `${fx.removed} הקלטות יימחקו לגמרי מהספריות, כי לא יישאר בהן כלום.` : '',
+        fx.voiceMarked === 1 ? 'הקלטה אחת תישאר עם הטקסט שלה, ותסומן "הקול נמחק".' : fx.voiceMarked ? `${fx.voiceMarked} הקלטות יישארו עם הטקסט שלהן, ויסומנו "הקול נמחק".` : '',
+        fx.tidyKeptNoRaw ? `ב${fx.tidyKeptNoRaw === 1 ? 'הקלטה אחת' : `-${fx.tidyKeptNoRaw} הקלטות`} תישאר רק הגרסה המסודרת.` : '',
+        fx.textKeptNoTidy ? `ב${fx.textKeptNoTidy === 1 ? 'הקלטה אחת' : `-${fx.textKeptNoTidy} הקלטות`} יישאר רק מה שאמרת. אפשר לסדר אותו מחדש.` : '',
+        fx.emptyKept === 1 ? 'הקלטה אחת תישאר בלי טקסט, עם הקול או התמונות שלה.' : fx.emptyKept ? `${fx.emptyKept} הקלטות יישארו בלי טקסט, עם הקול או התמונות שלהן.` : '',
+      ].filter(Boolean).map((s) => `<li>${esc(s)}</li>`).join('');
+      const scopeTxt = w.scope === 'pick' ? `מתוך ${w.picks.size} הקלטות שבחרת` : w.scope === 'range' && (w.from || w.to) ? `בטווח ${w.from ? 'מ-' + fmtDay(w.from) : 'מההתחלה'} ${w.to ? 'עד ' + fmtDay(w.to) : 'עד היום'}` : 'מכל התאריכים';
+      return frame(`<section class="card wipe-summary"><h2>מה יימחק</h2>
+        <p>${scopeTxt}:</p>
+        <ul class="wipe-list">${lines}</ul>
+        ${fxl ? `<ul class="wipe-list fx">${fxl}</ul>` : ''}
+        <p class="wipe-total">בסך הכול: <b>${w.plan.length.toLocaleString('he-IL')} פריטים, כ-${fmtBytes(total)}</b>. אי אפשר לבטל את המחיקה.</p>
+        <p class="note">לא יימחקו: הסיסמה, ההגדרות, הפתיחה ב-${P.biometricName}, וכל סוג שלא סימנת.</p></section>
+      <section class="card"><h2>גיבוי לפני המחיקה</h2>
+        <p class="note">מומלץ. הגיבוי שומר את כל ההקלטות, הגרסאות, הקול, התמונות והסיכומים כמו שהם עכשיו, בקובץ מוצפן. אפשר להשתמש בסיסמה של היומן.</p>
+        <label class="field">סיסמה לגיבוי<input type="password" id="wipe-bk-pw" autocomplete="new-password"></label>
+        ${w.bkErr ? `<p class="err">${esc(w.bkErr)}</p>` : ''}
+        <button class="btn honey wide" data-act="wipe-backup">${icon('download')}צור גיבוי עכשיו</button>
+        ${w.backupAt ? `<p class="upd-status ok" role="status">✓ הגיבוי נוצר ב-${hhmm(w.backupAt)}. ${P.isIOS ? 'הוא נשמר ב"קבצים", בתיקיית ההורדות.' : 'הוא נשמר בתיקיית ההורדות.'}</p>` : ''}</section>
+      <section class="card wipe-final"><h2>אישור סופי</h2>${recBlock}
+        <label class="field">הסיסמה של היומן<input type="password" id="wipe-pw" autocomplete="current-password"></label>
+        ${w.err ? `<p class="err" role="alert">${esc(w.err)}</p>` : ''}
+        <button class="btn red wide" data-act="wipe-do" ${recording || !w.plan.length ? 'disabled' : ''}>${icon('trash')}מחק לצמיתות</button>
+        ${ui.hasPrf ? `<button class="btn red wide" data-act="wipe-bio" ${recording || !w.plan.length ? 'disabled' : ''}>${icon('finger')}מחק באישור ${P.biometricName}</button>` : ''}
+        <button class="btn ghost wide" data-act="wipe-edit">חזרה לבחירה</button></section>`);
+    }
+
+    // ---- choose
+    const sel = wipeSel();
+    const t = WP.tally(w.atoms.filter((a) => WP.inScope(a, sel)));
+    const chosen = WP.select(w.atoms, sel);
+    const chosenBytes = chosen.reduce((n, a) => n + a.bytes, 0);
+    const seg = `<div class="seg">${[['all', 'הכול'], ['range', 'לפי תאריכים'], ['pick', 'הקלטות מסוימות']].map(([k, l]) => `<button data-act="wipe-scope" data-scope="${k}" class="${on(w.scope === k)}">${l}</button>`).join('')}</div>`;
+    let scopeBody = '<p class="note">כל מה שמסומן למטה יימחק, מכל התאריכים.</p>';
+    if (w.scope === 'range') {
+      scopeBody = `<div class="row wipe-dates"><label class="field">מתאריך<input type="date" id="wipe-from" data-change="wipe-from" value="${esc(w.from)}"></label>
+          <label class="field">עד תאריך<input type="date" id="wipe-to" data-change="wipe-to" value="${esc(w.to)}"></label></div>
+        <p class="note">${!WP.rangeOk(sel) ? '<span class="err">תאריך ההתחלה מאוחר מתאריך הסיום.</span>' : (w.from || w.to) ? `נבחר: ${w.from ? 'מ-' + fmtDay(w.from) : 'מההתחלה'} ${w.to ? 'עד ' + fmtDay(w.to) : 'עד היום'}, כולל שני הימים. סיכום שבועי או חודשי נכלל רק אם כל התקופה שלו בטווח.` : 'בלי תאריכים: הכול.'}</p>`;
+    } else if (w.scope === 'pick') {
+      const es = entriesSorted();
+      scopeBody = es.length ? `<div class="row"><button class="chip" data-act="wipe-pick-all">בחר הכול</button><button class="chip" data-act="wipe-pick-none">נקה בחירה</button><span class="note">נבחרו ${w.picks.size} מתוך ${es.length}</span></div>
+        <div class="list wipe-picks">${es.map((e) => `<label class="check wipe-pick"><input type="checkbox" data-change="wipe-pick" data-id="${e.id}" ${w.picks.has(e.id) ? 'checked' : ''}><span><span class="note">${fmtDay(e.dayKey)} · ${S.timeOf(e.createdAt)} · ${entryDur(e)}</span><br><b>${esc(entryTitle(e))}</b></span></label>`).join('')}</div>
+        <p class="note">כאן נמחק רק מה ששייך להקלטות שבחרת. תמונות יום שלא צורפו להקלטה, סיכומים ויומן האבחון נבחרים ב"הכול" או "לפי תאריכים".</p>` : '<p class="muted">אין הקלטות ביומן.</p>';
+    }
+    const types = WP.TYPES.map((ty) => {
+      const x = t[ty.key];
+      const can = WP.applicable(ty.key, sel);
+      const implied = ty.key === 'locations' && w.types.has('photos') && can;
+      const n = x ? x.count : 0;
+      const dis = !can || !n || implied;
+      const info = !can ? 'לא שייך להקלטה מסוימת' : implied ? 'נכלל במחיקת התמונות' : n ? `${WP.qty(ty.key, n)} · ${fmtBytes(x.bytes)}` : 'אין';
+      const checked = implied || (w.types.has(ty.key) && can && n);
+      return `<label class="check wipe-type${dis ? ' off' : ''}"><input type="checkbox" data-change="wipe-type" data-type="${ty.key}" ${checked ? 'checked' : ''} ${dis ? 'disabled' : ''}><span>${esc(ty.label)}<br><span class="note" data-count="${ty.key}">${info}</span></span></label>`;
+    }).join('');
+    const deps = wipeDeps(w, chosen).map((s) => `<li>${esc(s)}</li>`).join('');
+    return frame(`${recBlock}
+      <section class="card"><h2>מאיזה זמן</h2>${seg}${scopeBody}</section>
+      <section class="card"><h2>מה למחוק</h2>${types}
+        ${deps ? `<ul class="wipe-list deps">${deps}</ul>` : ''}</section>
+      <section class="card">
+        <p class="wipe-total" role="status">${chosen.length ? `נבחרו ${chosen.length.toLocaleString('he-IL')} פריטים, כ-${fmtBytes(chosenBytes)}.` : 'עוד לא נבחר כלום.'}</p>
+        <button class="btn wide" data-act="wipe-review" ${chosen.length && !recording ? '' : 'disabled'}>המשך לסיכום ואישור</button>
+        <p class="note">במסך הבא תראה בדיוק מה יימחק, תוכל ליצור גיבוי, ותאשר בסיסמה${ui.hasPrf ? ` או ב-${P.biometricName}` : ''}.</p></section>
+      <details class="card danger-zone"${w.resetOpen ? ' open' : ''}><summary>מחק את הכול ואפס את היומן</summary>
+        <p class="notice"><b>אזהרה ראשונה:</b> זה מוחק את כל היומן מהטלפון: כל ההקלטות, הקול, התמונות, הסיכומים, וגם ההגדרות, הסיסמה והפתיחה הביומטרית. אחר כך היומן מתחיל מאפס, כמו ביום הראשון.</p>
+        <p class="notice"><b>אזהרה שנייה: אין דרך חזרה.</b> רק קובץ גיבוי ששמרת קודם יוכל להחזיר משהו.</p>
+        <label class="check"><input type="checkbox" id="reset-ack"><span>הבנתי שאין דרך חזרה</span></label>
+        <label class="field">כדי לאשר, הקלד: אפס את היומן<input id="reset-word" autocomplete="off"></label>
+        <label class="field">הסיסמה של היומן<input type="password" id="reset-pw" autocomplete="current-password"></label>
+        ${w.resetErr ? `<p class="err" role="alert">${esc(w.resetErr)}</p>` : ''}
+        ${w.resetPw ? `<div class="confirm" role="alert"><p>בפעם האחרונה: למחוק את כל היומן ואת הסיסמה? אין דרך חזרה.</p><div class="row"><button class="btn red" data-act="reset-yes">כן, מחק הכול</button><button class="btn ghost" data-act="reset-cancel">ביטול</button></div></div>`
+          : `<button class="btn red wide" data-act="reset-do" ${recording ? 'disabled' : ''}>אפס את היומן</button>`}
+        <p class="note">${P.isIOS ? 'מפתח הגישה של Face ID נשאר ב"סיסמאות" של האייפון. אפשר למחוק אותו שם.' : 'מפתח הגישה של טביעת האצבע נשאר במנהל הסיסמאות. אפשר למחוק אותו שם.'}</p>
+      </details>`);
   },
 
   settings() {
@@ -680,6 +810,11 @@ const SCREENS = {
           <label class="field">איך לשחזר<select id="rs-mode"><option value="merge">להוסיף למה שיש</option><option value="replace">להחליף את כל מה שיש</option></select></label>
           <p class="err" hidden></p><button class="btn ghost" type="submit">שחזר</button></form>
       </details>
+      <details class="card"><summary>מחיקת נתונים</summary>
+        <p>אפשר לבחור מה למחוק מהטלפון: תמלולים, גרסאות מסודרות, קול, תמונות, סיכומים ועוד. הכול, לפי תאריכים, או הקלטות מסוימות.</p>
+        <p class="note">לפני המחיקה תראה בדיוק מה יימחק, תוכל ליצור גיבוי, ותאשר בסיסמה${ui.hasPrf ? ` או ב-${P.biometricName}` : ''}. הסיסמה, ההגדרות והפתיחה הביומטרית לא נמחקות.</p>
+        <button class="btn ghost wide" data-act="wipe-open">${icon('trash')}בחירת נתונים למחיקה</button>
+      </details>
       <details class="card"><summary>מה יוצא מהטלפון</summary>
         <ul style="margin:0;padding-inline-start:20px;display:flex;flex-direction:column;gap:6px">
           <li>בזמן הקלטה: הקול עובר לגוגל לצורך התמלול, דרך Chrome.</li>
@@ -740,6 +875,58 @@ const lastBgLine = (log) => { const l = (log || []).filter((x) => x.ev === 'rec-
 async function loadSettingsData() {
   ui.sd = { settings: await V.getSettings(), prf: await V.prfInfo(), storage: await V.storageInfo(), caps: await W.capabilities(), log: await V.getLog() };
   if (ui.screen === 'settings') render();
+}
+
+// ---------------------------------------------------------------- data deletion (1.6.4)
+const newWipe = () => ({ step: 'choose', scope: 'all', from: '', to: '', picks: new Set(), types: new Set(), atoms: null, plan: null, result: null, err: '', bkErr: '', backupAt: 0, resetErr: '', resetPw: '', resetOpen: false });
+const wipeSel = (w = ui.wipe) => ({ scope: w.scope, from: w.from, to: w.to, entryIds: w.picks, types: w.types });
+async function loadWipe() {
+  const w = ui.wipe;
+  if (!w) return;
+  try { w.atoms = await WP.scan({ skipJournal: ui.rec ? ui.rec.journalId : null }); }
+  catch (e) { w.scanErr = 'לא הצלחתי לספור את הנתונים: ' + (e.message || e.name); V.log('wipe-scan-failed', e.name || e.message); }
+  if (ui.wipe === w && ui.screen === 'wipe') render();
+}
+// Dependencies between kinds, said before anything is deleted.
+function wipeDeps(w, chosen) {
+  const T = w.types, out = [];
+  if (T.has('raw') && T.has('tidy')) out.push('הקלטה שלא יישאר בה כלום (בלי טקסט, קול ותמונות) תימחק לגמרי מהספריות. אם נשארים בה קול או תמונות, היא נשארת בתור "הקלטה בלי טקסט".');
+  else if (T.has('raw')) out.push('הגרסה המסודרת נשארת. אחרי מחיקת מה שאמרת אי אפשר לסדר אותה מחדש מהגולמי.');
+  else if (T.has('tidy')) out.push('מה שאמרת נשאר, ואפשר לסדר אותו מחדש מתי שתרצה.');
+  if (T.has('audio')) out.push('מחיקת הקול לא מוחקת את התמלול. ההקלטה תסומן "הקול נמחק".');
+  if (T.has('photos')) out.push('מחיקת תמונה מוחקת גם את המיקום שלה. הטקסט של ההקלטה נשאר.');
+  else if (T.has('locations')) out.push('התמונות נשארות, בלי מיקום ובלי קישור לגוגל מפות.');
+  if ((T.has('raw') || T.has('tidy')) && !T.has('summaries') && vault.summaries.size) out.push('סיכומים ותקצירים ששמרת לא נמחקים יחד עם ההקלטות. כדי למחוק גם אותם, סמן "סיכומים".');
+  if (T.has('summaries')) out.push('סיכומים שלא שמרת נבנים לבד מההקלטות שנשארות, ולכן אין מה למחוק בהם.');
+  if (T.has('pending') && chosen.some((a) => a.type === 'pending')) out.push('הקלטות שעוד לא נכנסו ליומן יימחקו בלי שתראה אותן.');
+  return out;
+}
+async function runWipe(auth, btn) {
+  const w = ui.wipe;
+  if (!w || !w.plan || !w.plan.length || ui.wiping) return;
+  if (ui.rec || ui.dict) { w.err = 'בזמן הקלטה אי אפשר למחוק. לא נמחק כלום.'; render(); return; }
+  ui.wiping = true;
+  w.err = '';
+  try {
+    const res = await busy(btn, 'מוחק…', () => WP.execute(w.plan, auth, { isRecording: () => !!(ui.rec || ui.dict) }));
+    w.result = res; w.step = 'done'; w.plan = null; w.atoms = null;
+    ui.undo.clear(); // the undo history holds old text: it must not bring deleted text back
+    if (res.done.draft) ui.draft = null;
+    if (ui.reader) ui.reader.stop();
+    const summary = WP.TYPES.filter((ty) => res.done[ty.key]).map((ty) => `${ty.key}=${res.done[ty.key]}`).join(' ');
+    if (!res.done.log) V.log('wipe', `${summary} entries-removed=${res.removedEntries} bytes=${res.freed} how=${auth.prf ? 'biometric' : 'password'}`);
+  } catch (e) {
+    w.err = e.code === 'bad-password' ? 'הסיסמה לא נכונה. לא נמחק כלום.'
+      : e.code === 'not-confirmed' ? `צריך להקליד את הסיסמה${ui.hasPrf ? ` או לאשר ב-${P.biometricName}` : ''}. לא נמחק כלום.`
+      : e.code === 'recording' ? 'בזמן הקלטה אי אפשר למחוק. לא נמחק כלום.'
+      : 'המחיקה נכשלה באמצע (' + (e.message || e.name) + '). ייתכן שחלק מהפריטים כבר נמחקו. כדאי לפתוח שוב את "מחיקת נתונים" ולבדוק.';
+    if (!['bad-password', 'not-confirmed', 'recording'].includes(e.code)) V.log('wipe-failed', e.name || e.message);
+  } finally {
+    ui.wiping = false;
+  }
+  if (ui.lockAfterWipe) { const r = ui.lockAfterWipe; ui.lockAfterWipe = null; doLock(r); return; }
+  render();
+  window.scrollTo(0, 0);
 }
 
 // ---------------------------------------------------------------- word editing
@@ -1259,6 +1446,8 @@ let lastActivity = Date.now();
 
 async function doLock(reason) {
   if (!V.isUnlocked()) return;
+  if (ui.wiping) { ui.lockAfterWipe = reason; return; } // a deletion in progress needs the key; lock right after it
+  ui.wipe = null;
   if (ui.screen === 'write') { try { await saveDraftNow(); } catch (e) { V.log('draft-save-failed', e.message); } }
   if (ui.reader) ui.reader.stop();
   V.lock();
@@ -1358,7 +1547,7 @@ async function readAloud(src) {
   if (src === 'entry') {
     const e = vault.entries.get(ui.entryId);
     if (!e) return;
-    title = e.tidy.title;
+    title = entryTitle(e);
     text = e.tidy.paragraphs.join('\n');
   } else {
     title = periodLabel(ui.sumKind, ui.sumKey);
@@ -1432,7 +1621,7 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
   'restore-mode-off': () => { ui.restoreMode = false; render(); },
   tab: (el) => { if (el.dataset.to === 'settings') ui.sd = null; go(el.dataset.to); },
   back: () => history.back(),
-  record: () => { const c = chooseInputPath(); return c.mode === 'dictation' ? startDictation('', c.reason) : startRecording(c.reason); },
+  record: () => { if (ui.wiping) { toast('המחיקה עדיין רצה. אפשר להקליט בעוד רגע.'); return; } const c = chooseInputPath(); return c.mode === 'dictation' ? startDictation('', c.reason) : startRecording(c.reason); },
   'write-new': () => openWrite({ mode: 'new' }),
   'write-append': () => openWrite({ mode: 'append', entryId: ui.entryId }),
   'write-save': (el) => busy(el, 'שומר…', saveWriting),
@@ -1502,7 +1691,7 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
   'del-entry-yes': async () => { await V.deleteEntry(ui.entryId); ui.confirm = null; toast('ההקלטה נמחקה.'); go('today', {}, 'replace'); },
   'share-entry': () => {
     const e = vault.entries.get(ui.entryId);
-    shareContent({ title: e.tidy.title, text: tidyText(e.tidy), photos: (e.photoIds || []).map((id) => vault.photos.get(id)).filter(Boolean) });
+    shareContent({ title: entryTitle(e), text: tidyText(e.tidy), photos: (e.photoIds || []).map((id) => vault.photos.get(id)).filter(Boolean) });
   },
   photo: (el) => {
     ui.photoTarget = { dayKey: el.dataset.day, entryId: el.dataset.entry || null };
@@ -1624,6 +1813,76 @@ const ACTIONS = {  'restore-mode': () => { ui.restoreMode = true; render(); },
     }
   },
   'lock-now': () => doLock('manual'),
+  'wipe-open': () => { ui.wipe = newWipe(); go('wipe'); loadWipe(); },
+  'wipe-back': () => { ui.wipe = null; ui.sd = null; go('settings'); },
+  'wipe-again': () => { ui.wipe = newWipe(); render(); window.scrollTo(0, 0); loadWipe(); },
+  'wipe-scope': (el) => { ui.wipe.scope = el.dataset.scope; render(); },
+  'wipe-pick-all': () => { ui.wipe.picks = new Set(entriesSorted().map((e) => e.id)); render(); },
+  'wipe-pick-none': () => { ui.wipe.picks = new Set(); render(); },
+  'wipe-review': () => {
+    const w = ui.wipe;
+    if (ui.rec || ui.dict) return;
+    const plan = WP.select(w.atoms || [], wipeSel());
+    if (!plan.length) return;
+    Object.assign(w, { plan, step: 'confirm', err: '', bkErr: '' });
+    render(); window.scrollTo(0, 0);
+  },
+  'wipe-edit': () => { Object.assign(ui.wipe, { step: 'choose', plan: null, err: '' }); render(); window.scrollTo(0, 0); },
+  'wipe-backup': async (el) => {
+    const w = ui.wipe;
+    const pw = ($('#wipe-bk-pw') || {}).value || '';
+    if (pw.length < 8) { w.bkErr = 'צריך סיסמה של לפחות 8 תווים לגיבוי.'; render(); return; }
+    w.bkErr = '';
+    const blob = await busy(el, 'מכין גיבוי…', () => V.exportBackup(pw));
+    downloadBlob(blob, `yoman-backup-${today()}.json`);
+    V.log('backup', 'before-wipe ' + blob.size);
+    await V.setSettings({ lastBackupAt: Date.now() });
+    await refreshSettings();
+    w.backupAt = Date.now();
+    render();
+  },
+  'wipe-do': (el) => runWipe({ password: ($('#wipe-pw') || {}).value || '' }, el),
+  'wipe-bio': async (el) => {
+    const p = ui.prfMeta;
+    if (!p || !ui.wipe) return;
+    let prf = null;
+    // Called directly inside the tap: Safari refuses WebAuthn calls that come after an await.
+    try { prf = await W.evaluate(p.credId, p.prfSalt); }
+    catch (e) { V.log('wipe-bio-failed', e.name || e.message); ui.wipe.err = e.name === 'NotAllowedError' ? 'האישור בוטל. לא נמחק כלום.' : 'האישור הביומטרי נכשל. אפשר להקליד סיסמה. לא נמחק כלום.'; render(); return; }
+    if (!prf) { ui.wipe.err = 'הטלפון לא החזיר את מפתח ההצפנה. אפשר להקליד סיסמה. לא נמחק כלום.'; render(); return; }
+    await runWipe({ prf }, el);
+  },
+  'reset-do': () => {
+    const w = ui.wipe;
+    w.resetOpen = true;
+    const ack = ($('#reset-ack') || {}).checked, word = (($('#reset-word') || {}).value || '').trim(), pw = ($('#reset-pw') || {}).value || '';
+    w.resetErr = !ack ? 'צריך לסמן "הבנתי שאין דרך חזרה".' : word !== 'אפס את היומן' ? 'צריך להקליד בדיוק: אפס את היומן' : !pw ? 'צריך להקליד את הסיסמה.' : '';
+    if (!w.resetErr) w.resetPw = pw; // kept in memory only until "כן, מחק הכול" or "ביטול"
+    render();
+  },
+  'reset-cancel': () => { Object.assign(ui.wipe, { resetPw: '', resetErr: '' }); render(); },
+  'reset-yes': async (el) => {
+    const w = ui.wipe;
+    const pw = w.resetPw;
+    w.resetPw = '';
+    if (ui.rec || ui.dict || ui.wiping) return;
+    ui.wiping = true;
+    try {
+      await busy(el, 'מוחק הכול…', () => V.resetAll({ password: pw }));
+    } catch (e) {
+      ui.wiping = false;
+      w.resetErr = e.code === 'bad-password' ? 'הסיסמה לא נכונה. לא נמחק כלום.' : 'האיפוס נכשל: ' + (e.message || e.name);
+      render();
+      return;
+    }
+    ui.wiping = false; ui.lockAfterWipe = null;
+    try { localStorage.removeItem(UPD_KEY); } catch (e) { /* ignore */ }
+    Object.assign(ui, { wipe: null, sd: null, draft: null, hasVault: false, hasPrf: false, prfMeta: null, hasInbox: false, bioPending: null, quick: false });
+    ui.undo.clear();
+    await refreshSettings();
+    go('setup', {}, 'replace');
+    toast('היומן אופס. אפשר ליצור יומן חדש, או לשחזר מגיבוי.', 8000);
+  },
   persist: async () => { const r = await V.requestPersist(); V.log('persist', String(r)); toast(r ? 'האחסון הקבוע אושר.' : 'הדפדפן לא אישר עדיין. התקנת היומן כאפליקציה בדרך כלל עוזרת.'); ui.sd = null; render(); },
   'copy-log': async () => { const ok = await copyText((await V.getLog()).map((l) => `${new Date(l.t).toISOString()} ${l.ev} ${l.detail}`).join('\n')); toast(ok ? 'הועתק.' : 'ההעתקה לא הצליחה.'); },
 };
@@ -1734,6 +1993,10 @@ const CHANGES = {
   'spoken-cues': async (el) => { await V.setSettings({ spokenCues: el.checked }); await refreshSettings(); },
   mic: async (el) => { await V.setSettings({ micDeviceId: el.value }); await refreshSettings(); toast(el.value ? 'המיקרופון נבחר. הוא ישמש להקלטת הקול, ואם הדפדפן מאפשר, גם לתמלול.' : 'חזרה למיקרופון ברירת המחדל.'); },
   'quick-capture': async (el) => { await V.setSettings({ quickCapture: el.checked }); await refreshSettings(); V.log('quick-capture', String(el.checked)); },  'input-mode': async (el) => { await V.setSettings({ inputMode: el.value, ...(el.value === 'auto' ? { speechFallback: null } : {}) }); await refreshSettings(); },
+  'wipe-type': (el) => { const T = ui.wipe.types; if (el.checked) T.add(el.dataset.type); else T.delete(el.dataset.type); render(); },
+  'wipe-from': (el) => { ui.wipe.from = el.value; render(); },
+  'wipe-to': (el) => { ui.wipe.to = el.value; render(); },
+  'wipe-pick': (el) => { const P2 = ui.wipe.picks; if (el.checked) P2.add(el.dataset.id); else P2.delete(el.dataset.id); render(); },
   'audio-keep': async (el) => { await V.setAudioKeep(el.dataset.id, el.checked); render(); toast(el.checked ? 'הקול יישמר לתמיד.' : 'הקול יימחק 30 יום אחרי ההקלטה.'); },
 };
 
@@ -1793,5 +2056,5 @@ async function boot() {
   go(ui.hasVault ? 'lock' : 'setup', {}, 'replace');
   announceUpdate();
 }
-if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake, updater, renderUpdateBar, VERSION, announceUpdate, UPD_KEY };
+if (TEST_DB) window.__app = { V, ui, go, render, S, VO, readAloud, SHARE_TEXT_MAX, WORD_PAGE, wake, updateWake, updater, renderUpdateBar, VERSION, announceUpdate, UPD_KEY, WP, summaryText };
 boot();
